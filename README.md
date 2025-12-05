@@ -1,3 +1,15 @@
+# Path Tracer
+
+High-performance C++ path tracer with SIMD acceleration.
+
+![Path Tracer Demo](pathtracer.gif)
+
+## Features
+- AVX/SIMD optimization for 4x+ speedup
+- OpenMP multi-threading
+- Multiple materials (diffuse, metal, dielectric)
+- JSON scene description
+
 ## Build & Run
 ```bash
 # Build the pathtracer
@@ -41,3 +53,19 @@ python create_video.py -w 8
 # Benchmark PPM readers
 python create_video.py --benchmark
 ```
+
+## Technical Highlights
+- Custom Vec3 with SIMD operations
+- Physically-based BRDF
+- Stratified sampling
+- BVH acceleration (planned)
+
+## Requirements
+```bash
+# For video generation
+pip install opencv-python numpy
+```
+
+
+## License
+MIT
