@@ -1560,7 +1560,7 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
     int checkZ = static_cast<int>(std::floor(pos.z));
     
     bool underWater = false;
-    for (int y = checkY + 1; y <= 11 && y < WORLD_HEIGHT; y++) {
+    for (int y = checkY; y <= 11 && y < WORLD_HEIGHT; y++) {
         if (world.getBlock(checkX, y, checkZ) == WATER) {
             underWater = true;
             break;
