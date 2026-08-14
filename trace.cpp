@@ -480,35 +480,145 @@ constexpr float MAX_RAY_DISTANCE = 500.0f;
 #define M_PI 3.14159265358979323846
 #endif
 
-// Math utilities
+// ============================================================
+// AVX2 SIMD kernels - 8-wide float math for the hot paths.
+// Standard immintrin intrinsics only (no FMA), so a plain
+// -mavx2 / /arch:AVX2 build works on both GCC and MSVC.
+// ============================================================
+struct F8 {
+    __m256 v;
+    F8() : v(_mm256_setzero_ps()) {}
+    F8(__m256 x) : v(x) {}
+    explicit F8(float x) : v(_mm256_set1_ps(x)) {}
+    static F8 load(const float* p) { return F8(_mm256_loadu_ps(p)); }
+    void store(float* p) const { _mm256_storeu_ps(p, v); }
+    F8 operator+(F8 b) const { return F8(_mm256_add_ps(v, b.v)); }
+    F8 operator-(F8 b) const { return F8(_mm256_sub_ps(v, b.v)); }
+    F8 operator*(F8 b) const { return F8(_mm256_mul_ps(v, b.v)); }
+    F8 operator/(F8 b) const { return F8(_mm256_div_ps(v, b.v)); }
+    F8 operator-() const { return F8(_mm256_sub_ps(_mm256_setzero_ps(), v)); }
+};
+inline F8 min8(F8 a, F8 b) { return F8(_mm256_min_ps(a.v, b.v)); }
+inline F8 max8(F8 a, F8 b) { return F8(_mm256_max_ps(a.v, b.v)); }
+inline F8 sqrt8(F8 a) { return F8(_mm256_sqrt_ps(a.v)); }
+inline F8 abs8(F8 a) { return F8(_mm256_andnot_ps(_mm256_set1_ps(-0.0f), a.v)); }
+inline F8 floor8(F8 a) { return F8(_mm256_floor_ps(a.v)); }
+inline F8 and8(F8 a, F8 b) { return F8(_mm256_and_ps(a.v, b.v)); }
+inline F8 cmpge8(F8 a, F8 b) { return F8(_mm256_cmp_ps(a.v, b.v, _CMP_GE_OQ)); }
+inline F8 cmple8(F8 a, F8 b) { return F8(_mm256_cmp_ps(a.v, b.v, _CMP_LE_OQ)); }
+inline F8 cmplt8(F8 a, F8 b) { return F8(_mm256_cmp_ps(a.v, b.v, _CMP_LT_OQ)); }
+
+// Horizontal sum of all 8 lanes
+inline float hsum8(F8 a) {
+    __m128 lo = _mm256_castps256_ps128(a.v);
+    __m128 hi = _mm256_extractf128_ps(a.v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+    return _mm_cvtss_f32(lo);
+}
+
+// 8-wide simultaneous sin+cos, Cephes-style quadrant reduction
+// (same accuracy class as scalar sinf/cosf for the argument ranges used here)
+inline void sincos8(F8 x, F8& outSin, F8& outCos) {
+    const __m256 signMask = _mm256_set1_ps(-0.0f);
+    __m256 sinSign = _mm256_and_ps(x.v, signMask);
+    __m256 ax = _mm256_andnot_ps(signMask, x.v);
+
+    __m256 y = _mm256_mul_ps(ax, _mm256_set1_ps(1.27323954473516f)); // 4/pi
+    __m256i j = _mm256_cvttps_epi32(y);
+    j = _mm256_add_epi32(j, _mm256_set1_epi32(1));
+    j = _mm256_and_si256(j, _mm256_set1_epi32(~1));
+    y = _mm256_cvtepi32_ps(j);
+
+    // sin sign flips when j&4; cos sign flips when (~(j-2))&4; polynomials swap when j&2
+    __m256 swapSign = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_and_si256(j, _mm256_set1_epi32(4)), 29));
+    __m256i jc = _mm256_andnot_si256(_mm256_sub_epi32(j, _mm256_set1_epi32(2)), _mm256_set1_epi32(4));
+    __m256 cosSign = _mm256_castsi256_ps(_mm256_slli_epi32(jc, 29));
+    sinSign = _mm256_xor_ps(sinSign, swapSign);
+    __m256 polySwap = _mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(j, _mm256_set1_epi32(2)), _mm256_set1_epi32(2)));
+
+    // Extended-precision argument reduction: ax = ((ax - y*DP1) - y*DP2) - y*DP3
+    ax = _mm256_add_ps(ax, _mm256_mul_ps(y, _mm256_set1_ps(-0.78515625f)));
+    ax = _mm256_add_ps(ax, _mm256_mul_ps(y, _mm256_set1_ps(-2.4187564849853515625e-4f)));
+    ax = _mm256_add_ps(ax, _mm256_mul_ps(y, _mm256_set1_ps(-3.77489497744594108e-8f)));
+    __m256 z = _mm256_mul_ps(ax, ax);
+
+    __m256 sp = _mm256_set1_ps(-1.9515295891e-4f);
+    sp = _mm256_add_ps(_mm256_mul_ps(sp, z), _mm256_set1_ps(8.3321608736e-3f));
+    sp = _mm256_add_ps(_mm256_mul_ps(sp, z), _mm256_set1_ps(-1.6666654611e-1f));
+    sp = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(sp, z), ax), ax);
+
+    __m256 cp = _mm256_set1_ps(2.443315711809948e-5f);
+    cp = _mm256_add_ps(_mm256_mul_ps(cp, z), _mm256_set1_ps(-1.388731625493765e-3f));
+    cp = _mm256_add_ps(_mm256_mul_ps(cp, z), _mm256_set1_ps(4.166664568298827e-2f));
+    cp = _mm256_mul_ps(cp, _mm256_mul_ps(z, z));
+    cp = _mm256_add_ps(cp, _mm256_add_ps(_mm256_mul_ps(z, _mm256_set1_ps(-0.5f)), _mm256_set1_ps(1.0f)));
+
+    __m256 sinPoly = _mm256_blendv_ps(sp, cp, polySwap);
+    __m256 cosPoly = _mm256_blendv_ps(cp, sp, polySwap);
+    outSin = F8(_mm256_xor_ps(sinPoly, sinSign));
+    outCos = F8(_mm256_xor_ps(cosPoly, cosSign));
+}
+
+inline F8 sin8(F8 x) { F8 s, c; sincos8(x, s, c); return s; }
+
+// 8-wide expf, Cephes-style
+inline F8 exp8(F8 x) {
+    __m256 xv = _mm256_min_ps(x.v, _mm256_set1_ps(88.3762626647949f));
+    xv = _mm256_max_ps(xv, _mm256_set1_ps(-88.3762626647949f));
+    __m256 fx = _mm256_floor_ps(_mm256_add_ps(_mm256_mul_ps(xv, _mm256_set1_ps(1.44269504088896341f)), _mm256_set1_ps(0.5f)));
+    xv = _mm256_sub_ps(xv, _mm256_mul_ps(fx, _mm256_set1_ps(0.693359375f)));
+    xv = _mm256_sub_ps(xv, _mm256_mul_ps(fx, _mm256_set1_ps(-2.12194440e-4f)));
+    __m256 z = _mm256_mul_ps(xv, xv);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_add_ps(_mm256_mul_ps(y, xv), _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_add_ps(_mm256_mul_ps(y, xv), _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_add_ps(_mm256_mul_ps(y, xv), _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_add_ps(_mm256_mul_ps(y, xv), _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_add_ps(_mm256_mul_ps(y, xv), _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(y, z), xv), _mm256_set1_ps(1.0f));
+    __m256i n = _mm256_cvttps_epi32(fx);
+    n = _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
+    return F8(_mm256_mul_ps(y, _mm256_castsi256_ps(n)));
+}
+
+// Math utilities - Vec3 backed by a 128-bit SSE register (x, y, z, 0)
 struct Vec3 {
-    float x, y, z;
-    Vec3() : x(0), y(0), z(0) {}
-    Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
-    
-    Vec3 operator+(const Vec3& v) const { return Vec3(x + v.x, y + v.y, z + v.z); }
-    Vec3 operator-(const Vec3& v) const { return Vec3(x - v.x, y - v.y, z - v.z); }
-    Vec3 operator*(float t) const { return Vec3(x * t, y * t, z * t); }
-    Vec3 operator*(const Vec3& v) const { return Vec3(x * v.x, y * v.y, z * v.z); }
-    Vec3 operator/(float t) const { return Vec3(x / t, y / t, z / t); }
-    Vec3 operator-() const { return Vec3(-x, -y, -z); }
-    
-    float dot(const Vec3& v) const { return x * v.x + y * v.y + z * v.z; }
+    union {
+        __m128 m;
+        struct { float x, y, z, wPad; };
+    };
+    Vec3() : m(_mm_setzero_ps()) {}
+    Vec3(float x, float y, float z) : m(_mm_set_ps(0.0f, z, y, x)) {}
+    explicit Vec3(__m128 v) : m(v) {}
+
+    Vec3 operator+(const Vec3& v) const { return Vec3(_mm_add_ps(m, v.m)); }
+    Vec3 operator-(const Vec3& v) const { return Vec3(_mm_sub_ps(m, v.m)); }
+    Vec3 operator*(float t) const { return Vec3(_mm_mul_ps(m, _mm_set1_ps(t))); }
+    Vec3 operator*(const Vec3& v) const { return Vec3(_mm_mul_ps(m, v.m)); }
+    Vec3 operator/(float t) const { return Vec3(_mm_div_ps(m, _mm_set1_ps(t))); }
+    Vec3 operator-() const { return Vec3(_mm_sub_ps(_mm_setzero_ps(), m)); }
+
+    float dot(const Vec3& v) const { return _mm_cvtss_f32(_mm_dp_ps(m, v.m, 0x71)); }
     Vec3 cross(const Vec3& v) const {
-        return Vec3(y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x);
+        __m128 aYzx = _mm_shuffle_ps(m, m, _MM_SHUFFLE(3, 0, 2, 1));
+        __m128 bYzx = _mm_shuffle_ps(v.m, v.m, _MM_SHUFFLE(3, 0, 2, 1));
+        __m128 c = _mm_sub_ps(_mm_mul_ps(m, bYzx), _mm_mul_ps(aYzx, v.m));
+        return Vec3(_mm_shuffle_ps(c, c, _MM_SHUFFLE(3, 0, 2, 1)));
     }
-    
-    float length() const { return std::sqrt(x * x + y * y + z * z); }
-    Vec3 normalize() const { 
-        float l = length(); 
-        return l > 0 ? *this / l : Vec3(); 
+
+    float length() const { return std::sqrt(dot(*this)); }
+    Vec3 normalize() const {
+        float l = length();
+        return l > 0 ? *this / l : Vec3();
     }
-    
-    Vec3& operator+=(const Vec3& v) { 
-        x += v.x; y += v.y; z += v.z; 
-        return *this; 
+
+    Vec3& operator+=(const Vec3& v) {
+        m = _mm_add_ps(m, v.m);
+        return *this;
     }
-    
+
     bool near_zero() const {
         const float s = 1e-8f;
         return (std::abs(x) < s) && (std::abs(y) < s) && (std::abs(z) < s);
@@ -633,40 +743,47 @@ inline float smoothstep(float t) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-// Simple 3D value noise
+// Simple 3D value noise - all 8 cube-corner hashes computed in one 8-wide sin.
+// Corner k adds its (dx,dy,dz) offsets pre-multiplied by the hash coefficients,
+// so lane k holds hash(ix+dx, iy+dy, iz+dz) in n000..n111 order.
 inline float noise3D(float x, float y, float z) {
     float ix = std::floor(x);
     float iy = std::floor(y);
     float iz = std::floor(z);
-    
+
     float fx = x - ix;
     float fy = y - iy;
     float fz = z - iz;
-    
-    // Get noise values at cube corners
-    float n000 = hash(ix, iy, iz);
-    float n100 = hash(ix + 1, iy, iz);
-    float n010 = hash(ix, iy + 1, iz);
-    float n110 = hash(ix + 1, iy + 1, iz);
-    float n001 = hash(ix, iy, iz + 1);
-    float n101 = hash(ix + 1, iy, iz + 1);
-    float n011 = hash(ix, iy + 1, iz + 1);
-    float n111 = hash(ix + 1, iy + 1, iz + 1);
-    
+
+    const __m256 cornerOfs = _mm256_setr_ps(
+        0.0f,                            // (0,0,0)
+        12.9898f,                        // (1,0,0)
+        78.233f,                         // (0,1,0)
+        12.9898f + 78.233f,              // (1,1,0)
+        37.719f,                         // (0,0,1)
+        12.9898f + 37.719f,              // (1,0,1)
+        78.233f + 37.719f,               // (0,1,1)
+        12.9898f + 78.233f + 37.719f);   // (1,1,1)
+    float base = ix * 12.9898f + iy * 78.233f + iz * 37.719f;
+    F8 n = sin8(F8(base) + F8(cornerOfs)) * F8(43758.5453f);
+    F8 corners = n - floor8(n);
+    alignas(32) float h[8];
+    corners.store(h);
+
     // Smooth the fractional parts
     float sx = smoothstep(fx);
     float sy = smoothstep(fy);
     float sz = smoothstep(fz);
-    
+
     // Trilinear interpolation
-    float nx00 = lerp(n000, n100, sx);
-    float nx10 = lerp(n010, n110, sx);
-    float nx01 = lerp(n001, n101, sx);
-    float nx11 = lerp(n011, n111, sx);
-    
+    float nx00 = lerp(h[0], h[1], sx);
+    float nx10 = lerp(h[2], h[3], sx);
+    float nx01 = lerp(h[4], h[5], sx);
+    float nx11 = lerp(h[6], h[7], sx);
+
     float nxy0 = lerp(nx00, nx10, sy);
     float nxy1 = lerp(nx01, nx11, sy);
-    
+
     return lerp(nxy0, nxy1, sz);
 }
 
@@ -933,7 +1050,8 @@ class World {
     }
     
 public:
-    World() : blocks(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE, AIR), seed(42) {}
+    // +8 tail bytes so 4-byte SIMD gathers at the last block index stay in-bounds
+    World() : blocks(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE + 8, AIR), seed(42) {}
     
     void generate(int newSeed) {
         seed = newSeed;
@@ -1090,8 +1208,110 @@ public:
                 break;
             }
         }
-        
+
         return false;
+    }
+
+    // 8-wide shadow raycast: 8 origins, one shared direction (volumetric shadow
+    // rays all point at the sun, so the DDA steps/deltas are uniform and only
+    // per-lane voxel coords and tMax values diverge). Lanes march in lockstep
+    // with masked termination. Mirrors raycast() semantics: outBlock[i] is the
+    // first hit block (WATER = crossed a water surface), or AIR when nothing is
+    // hit within maxDist / the ray leaves the world.
+    void raycastShadow8(const float* ox, const float* oy, const float* oz,
+                        const Vec3& dirIn, float maxDist,
+                        const bool laneActive[8], uint8_t outBlock[8]) const {
+        Vec3 dir = dirIn.normalize();
+        const uint8_t* bp = blocks.data();
+        const __m256i widthV = _mm256_set1_epi32(WORLD_SIZE);
+        const __m256i heightV = _mm256_set1_epi32(WORLD_HEIGHT);
+        const __m256i minusOne = _mm256_set1_epi32(-1);
+        const __m256i strideY = _mm256_set1_epi32(WORLD_SIZE);
+        const __m256i strideZ = _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT);
+        const __m256i maxIdx = _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE - 1);
+        const __m256i waterV = _mm256_set1_epi32(WATER);
+
+        F8 pox = F8::load(ox), poy = F8::load(oy), poz = F8::load(oz);
+        F8 fx = floor8(pox), fy = floor8(poy), fz = floor8(poz);
+        __m256i x = _mm256_cvttps_epi32(fx.v);
+        __m256i y = _mm256_cvttps_epi32(fy.v);
+        __m256i z = _mm256_cvttps_epi32(fz.v);
+
+        int stepX = dir.x > 0 ? 1 : -1;
+        int stepY = dir.y > 0 ? 1 : -1;
+        int stepZ = dir.z > 0 ? 1 : -1;
+
+        F8 tMaxX = (dir.x != 0) ? (fx + F8(stepX > 0 ? 1.0f : 0.0f) - pox) / F8(dir.x) : F8(1e30f);
+        F8 tMaxY = (dir.y != 0) ? (fy + F8(stepY > 0 ? 1.0f : 0.0f) - poy) / F8(dir.y) : F8(1e30f);
+        F8 tMaxZ = (dir.z != 0) ? (fz + F8(stepZ > 0 ? 1.0f : 0.0f) - poz) / F8(dir.z) : F8(1e30f);
+        float tDeltaX = (dir.x != 0) ? stepX / dir.x : 1e30f;
+        float tDeltaY = (dir.y != 0) ? stepY / dir.y : 1e30f;
+        float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
+
+        auto inBoundsMask = [&]() {
+            __m256i okX = _mm256_and_si256(_mm256_cmpgt_epi32(x, minusOne), _mm256_cmpgt_epi32(widthV, x));
+            __m256i okY = _mm256_and_si256(_mm256_cmpgt_epi32(y, minusOne), _mm256_cmpgt_epi32(heightV, y));
+            __m256i okZ = _mm256_and_si256(_mm256_cmpgt_epi32(z, minusOne), _mm256_cmpgt_epi32(widthV, z));
+            return _mm256_and_si256(okX, _mm256_and_si256(okY, okZ));
+        };
+        auto gatherBlocks = [&](__m256i inBounds) {
+            __m256i idx = _mm256_add_epi32(x, _mm256_add_epi32(_mm256_mullo_epi32(y, strideY),
+                                                               _mm256_mullo_epi32(z, strideZ)));
+            idx = _mm256_max_epi32(_mm256_min_epi32(idx, maxIdx), _mm256_setzero_si256());
+            __m256i raw = _mm256_i32gather_epi32((const int*)bp, idx, 1);
+            __m256i b = _mm256_and_si256(raw, _mm256_set1_epi32(0xFF));
+            return _mm256_and_si256(b, inBounds);   // out-of-bounds reads as AIR, like getBlock()
+        };
+
+        __m256i active = _mm256_setr_epi32(
+            laneActive[0] ? -1 : 0, laneActive[1] ? -1 : 0, laneActive[2] ? -1 : 0, laneActive[3] ? -1 : 0,
+            laneActive[4] ? -1 : 0, laneActive[5] ? -1 : 0, laneActive[6] ? -1 : 0, laneActive[7] ? -1 : 0);
+        __m256i result = _mm256_setzero_si256();    // AIR = no hit
+        __m256i inWater = _mm256_cmpeq_epi32(gatherBlocks(inBoundsMask()), waterV);
+
+        for (int guard = 0; guard < 2048; guard++) {
+            if (_mm256_movemask_ps(_mm256_castsi256_ps(active)) == 0) break;
+
+            __m256i block = gatherBlocks(inBoundsMask());
+            __m256i isAir = _mm256_cmpeq_epi32(block, _mm256_setzero_si256());
+            __m256i isWater = _mm256_cmpeq_epi32(block, waterV);
+            __m256i waterSurface = _mm256_or_si256(_mm256_and_si256(inWater, isAir),
+                                                   _mm256_andnot_si256(inWater, isWater));
+            __m256i isSolid = _mm256_andnot_si256(_mm256_or_si256(isAir, isWater), minusOne);
+            __m256i hit = _mm256_and_si256(active, _mm256_or_si256(waterSurface, isSolid));
+            __m256i hitVal = _mm256_blendv_epi8(block, waterV, waterSurface);
+            result = _mm256_blendv_epi8(result, hitVal, hit);
+            active = _mm256_andnot_si256(hit, active);
+
+            inWater = _mm256_blendv_epi8(inWater, minusOne, _mm256_and_si256(active, isWater));
+            inWater = _mm256_andnot_si256(_mm256_and_si256(active, isAir), inWater);
+
+            // DDA step: same tie-breaking as the scalar version
+            __m256 ltXY = _mm256_cmp_ps(tMaxX.v, tMaxY.v, _CMP_LT_OQ);
+            __m256 ltXZ = _mm256_cmp_ps(tMaxX.v, tMaxZ.v, _CMP_LT_OQ);
+            __m256 ltYZ = _mm256_cmp_ps(tMaxY.v, tMaxZ.v, _CMP_LT_OQ);
+            __m256 maskX = _mm256_and_ps(ltXY, ltXZ);
+            __m256 maskY = _mm256_andnot_ps(ltXY, ltYZ);
+            __m256 maskZ = _mm256_andnot_ps(_mm256_or_ps(maskX, maskY), _mm256_castsi256_ps(minusOne));
+
+            __m256 dist = _mm256_blendv_ps(tMaxZ.v, tMaxY.v, maskY);
+            dist = _mm256_blendv_ps(dist, tMaxX.v, maskX);
+
+            x = _mm256_add_epi32(x, _mm256_and_si256(_mm256_set1_epi32(stepX), _mm256_castps_si256(maskX)));
+            y = _mm256_add_epi32(y, _mm256_and_si256(_mm256_set1_epi32(stepY), _mm256_castps_si256(maskY)));
+            z = _mm256_add_epi32(z, _mm256_and_si256(_mm256_set1_epi32(stepZ), _mm256_castps_si256(maskZ)));
+            tMaxX = F8(_mm256_blendv_ps(tMaxX.v, _mm256_add_ps(tMaxX.v, _mm256_set1_ps(tDeltaX)), maskX));
+            tMaxY = F8(_mm256_blendv_ps(tMaxY.v, _mm256_add_ps(tMaxY.v, _mm256_set1_ps(tDeltaY)), maskY));
+            tMaxZ = F8(_mm256_blendv_ps(tMaxZ.v, _mm256_add_ps(tMaxZ.v, _mm256_set1_ps(tDeltaZ)), maskZ));
+
+            __m256 distOk = _mm256_cmp_ps(dist, _mm256_set1_ps(maxDist), _CMP_LT_OQ);
+            active = _mm256_and_si256(active, _mm256_castps_si256(distOk));
+            active = _mm256_and_si256(active, inBoundsMask());
+        }
+
+        alignas(32) int res[8];
+        _mm256_store_si256((__m256i*)res, result);
+        for (int i = 0; i < 8; i++) outBlock[i] = (uint8_t)res[i];
     }
 };
 
@@ -1141,32 +1361,67 @@ public:
     }
 };
 
-// Enhanced water surface normal for better caustics
+// Enhanced water surface normal for better caustics.
+// The 7 distinct wave angles are evaluated with one 8-wide sincos instead of
+// 13 scalar sin/cos calls; the height field itself cancels out of the normal.
 inline Vec3 getWaterNormal(const Vec3& pos, float time) {
-    // Multi-frequency waves for complex caustic patterns
-    float wave1 = std::sin(pos.x * 2.0f + time * 1.2f) * std::cos(pos.z * 1.8f - time * 0.9f);
-    float wave2 = std::sin(pos.x * 3.5f - time * 1.5f) * std::cos(pos.z * 3.2f + time * 1.1f) * 0.5f;
-    float wave3 = std::sin((pos.x + pos.z) * 1.2f + time * 0.7f) * 0.3f;
-    float wave4 = std::sin(pos.x * 5.0f + time * 2.0f) * std::cos(pos.z * 4.5f - time * 1.8f) * 0.25f;
-    
-    float height = (wave1 + wave2 + wave3 + wave4) * 0.12f;
-    
-    // Calculate derivatives for normal
+    alignas(32) float ang[8] = {
+        pos.x * 2.0f + time * 1.2f,
+        pos.z * 1.8f - time * 0.9f,
+        pos.x * 3.5f - time * 1.5f,
+        pos.z * 3.2f + time * 1.1f,
+        (pos.x + pos.z) * 1.2f + time * 0.7f,
+        pos.x * 5.0f + time * 2.0f,
+        pos.z * 4.5f - time * 1.8f,
+        0.0f
+    };
+    F8 s8, c8;
+    sincos8(F8::load(ang), s8, c8);
+    alignas(32) float sv[8], cv[8];
+    s8.store(sv);
+    c8.store(cv);
+
     float dx = 0.12f * (
-        2.0f * std::cos(pos.x * 2.0f + time * 1.2f) * std::cos(pos.z * 1.8f - time * 0.9f) +
-        3.5f * std::cos(pos.x * 3.5f - time * 1.5f) * std::cos(pos.z * 3.2f + time * 1.1f) * 0.5f +
-        1.2f * std::cos((pos.x + pos.z) * 1.2f + time * 0.7f) * 0.3f +
-        5.0f * std::cos(pos.x * 5.0f + time * 2.0f) * std::cos(pos.z * 4.5f - time * 1.8f) * 0.25f
+        2.0f * cv[0] * cv[1] +
+        3.5f * cv[2] * cv[3] * 0.5f +
+        1.2f * cv[4] * 0.3f +
+        5.0f * cv[5] * cv[6] * 0.25f
     );
-    
     float dz = 0.12f * (
-        -1.8f * std::sin(pos.x * 2.0f + time * 1.2f) * std::sin(pos.z * 1.8f - time * 0.9f) +
-        3.2f * std::sin(pos.x * 3.5f - time * 1.5f) * std::sin(pos.z * 3.2f + time * 1.1f) * 0.5f +
-        1.2f * std::cos((pos.x + pos.z) * 1.2f + time * 0.7f) * 0.3f -
-        4.5f * std::sin(pos.x * 5.0f + time * 2.0f) * std::sin(pos.z * 4.5f - time * 1.8f) * 0.25f
+        -1.8f * sv[0] * sv[1] +
+        3.2f * sv[2] * sv[3] * 0.5f +
+        1.2f * cv[4] * 0.3f -
+        4.5f * sv[5] * sv[6] * 0.25f
     );
-    
+
     return Vec3(-dx, 1.0f, -dz).normalize();
+}
+
+// SoA variant: water surface normals at 8 (px, 11, pz) points at once,
+// used by the vectorized caustics sampling loop
+inline void waterNormal8(F8 px, F8 pz, float time, F8& nx, F8& ny, F8& nz) {
+    F8 sa1, ca1, sb1, cb1, sa2, ca2, sb2, cb2, sc, cc, sa3, ca3, sb3, cb3;
+    sincos8(px * F8(2.0f) + F8(time * 1.2f), sa1, ca1);
+    sincos8(pz * F8(1.8f) - F8(time * 0.9f), sb1, cb1);
+    sincos8(px * F8(3.5f) - F8(time * 1.5f), sa2, ca2);
+    sincos8(pz * F8(3.2f) + F8(time * 1.1f), sb2, cb2);
+    sincos8((px + pz) * F8(1.2f) + F8(time * 0.7f), sc, cc);
+    sincos8(px * F8(5.0f) + F8(time * 2.0f), sa3, ca3);
+    sincos8(pz * F8(4.5f) - F8(time * 1.8f), sb3, cb3);
+
+    F8 dx = F8(0.12f) * (F8(2.0f) * ca1 * cb1 +
+                         F8(3.5f * 0.5f) * ca2 * cb2 +
+                         F8(1.2f * 0.3f) * cc +
+                         F8(5.0f * 0.25f) * ca3 * cb3);
+    F8 dz = F8(0.12f) * (F8(-1.8f) * sa1 * sb1 +
+                         F8(3.2f * 0.5f) * sa2 * sb2 +
+                         F8(1.2f * 0.3f) * cc +
+                         F8(-4.5f * 0.25f) * sa3 * sb3);
+
+    F8 invLen = F8(1.0f) / sqrt8(dx * dx + dz * dz + F8(1.0f));
+    nx = -dx * invLen;
+    ny = invLen;
+    nz = -dz * invLen;
 }
 
 // Get sky color
@@ -1204,74 +1459,91 @@ Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun) {
     return skyGradient;
 }
 
-// Calculate volumetrics
+// Calculate volumetrics. The 12 shadow rays all point at the sun, so they are
+// marched as SIMD packets (raycastShadow8) and the per-sample attenuation math
+// runs 8-wide. One behavior fix vs the scalar original: when a shadow ray hit
+// nothing, the old code read an uninitialized hitBlock (UB); a miss is now a
+// defined "sun fully visible".
 Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater) {
-    Vec3 volumetricLight(0, 0, 0);
-    
-    if (!g_settings.enableVolumetrics) return volumetricLight;
-    
+    if (!g_settings.enableVolumetrics) return Vec3(0, 0, 0);
+
     const int numSamples = 12;
     float stepSize = std::min(maxDist, 50.0f) / float(numSamples);
-    
+
     float scatteringCoeff = inWater ? 0.2f : 0.04f;
     float absorptionCoeff = inWater ? 0.08f : 0.01f;
-    
+
     float cosTheta = ray.direction.dot(-sun.direction);
     float g = inWater ? 0.8f : 0.6f;
     float phase = (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
-    
+
+    // Jittered sample positions along the ray (SoA, padded to 2 groups of 8)
+    alignas(32) float ts[16], sx[16], sy[16], sz[16];
+    bool laneActive[16];
     for (int i = 0; i < numSamples; i++) {
         float t = stepSize * (i + random01() * 0.5f);
         Vec3 samplePos = ray.at(t);
-        
-        int sx = static_cast<int>(std::floor(samplePos.x));
-        int sy = static_cast<int>(std::floor(samplePos.y));
-        int sz = static_cast<int>(std::floor(samplePos.z));
-        
-        bool sampleInWater = (world.getBlock(sx, sy, sz) == WATER);
-        
-        if (sampleInWater != inWater) continue;
-        
-        Ray shadowRay(samplePos, -sun.direction);
-        Vec3 shadowHit, shadowNormal;
-        BlockType shadowBlock;
-        
-        bool sunVisible = !world.raycast(shadowRay, 100.0f, shadowHit, shadowNormal, shadowBlock);
-        float intensity = sun.intensity;
-        
-        if (shadowBlock == WATER && !inWater) {
-            sunVisible = true;
-            intensity *= 0.5f;
-        } else if (shadowBlock == LEAVES) {
-            sunVisible = true;
-            intensity *= 0.3f;
-        }
-        
-        if (sunVisible) {
-            if (inWater) {
-                float depth = std::max(0.0f, 11.0f - samplePos.y);
-                intensity *= std::exp(-depth * 0.05f);
-            }
-            
-            if (!inWater) {
-                float heightFactor = std::exp(-(samplePos.y - 10.0f) * 0.02f);
-                heightFactor = std::max(0.1f, std::min(1.0f, heightFactor));
-                intensity *= heightFactor;
-            }
-            
-            Vec3 inScattering = sun.color * intensity * scatteringCoeff * phase;
-            float absorption = std::exp(-t * absorptionCoeff);
-            volumetricLight = volumetricLight + inScattering * absorption * stepSize;
-        }
+        ts[i] = t;
+        sx[i] = samplePos.x;
+        sy[i] = samplePos.y;
+        sz[i] = samplePos.z;
+        bool sampleInWater = (world.getBlock(static_cast<int>(std::floor(samplePos.x)),
+                                            static_cast<int>(std::floor(samplePos.y)),
+                                            static_cast<int>(std::floor(samplePos.z))) == WATER);
+        laneActive[i] = (sampleInWater == inWater);
     }
-    
+    for (int i = numSamples; i < 16; i++) {
+        ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
+        laneActive[i] = false;
+    }
+
+    Vec3 toSun = -sun.direction;
+    float total = 0.0f;
+    for (int group = 0; group < 2; group++) {
+        int base = group * 8;
+        uint8_t hitBlock[8];
+        world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
+                             laneActive + base, hitBlock);
+
+        alignas(32) float lane[8];
+        for (int L = 0; L < 8; L++) {
+            if (!laneActive[base + L]) { lane[L] = 0.0f; continue; }
+            uint8_t hb = hitBlock[L];
+            float intensity = sun.intensity;
+            if (hb == AIR) {                          // nothing hit: sun fully visible
+            } else if (hb == WATER && !inWater) {
+                intensity *= 0.5f;
+            } else if (hb == LEAVES) {
+                intensity *= 0.3f;
+            } else {
+                intensity = 0.0f;                     // blocked by solid geometry
+            }
+            lane[L] = intensity;
+        }
+
+        F8 li = F8::load(lane);
+        F8 yv = F8::load(sy + base);
+        F8 att;
+        if (inWater) {
+            F8 depth = max8(F8(0.0f), F8(11.0f) - yv);
+            att = exp8(depth * F8(-0.05f));
+        } else {
+            F8 heightFactor = exp8((yv - F8(10.0f)) * F8(-0.02f));
+            att = min8(F8(1.0f), max8(F8(0.1f), heightFactor));
+        }
+        F8 absorption = exp8(F8::load(ts + base) * F8(-absorptionCoeff));
+        total += hsum8(li * att * absorption);
+    }
+
+    Vec3 volumetricLight = sun.color * (total * scatteringCoeff * phase * stepSize);
+
     if (inWater) {
         volumetricLight = volumetricLight * Vec3(0.7f, 0.9f, 1.0f);
     } else {
         float timeStrength = 1.0f + 2.0f * (1.0f - std::abs(g_settings.timeOfDay - 0.5f) * 2.0f);
         volumetricLight = volumetricLight * Vec3(1.0f, 0.95f, 0.9f) * timeStrength;
     }
-    
+
     return volumetricLight * 3.0f;
 }
 
@@ -1315,54 +1587,58 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
     // Sample area size - smaller = sharper caustics
     float sampleRadius = 1.5f;
     
-    for (int i = 0; i < samples; i++) {
-        // Sample point on water surface above (stratified sampling for better quality)
-        float angle = (i + random01()) * 2.0f * M_PI / float(samples);
-        float radius = std::sqrt(random01()) * sampleRadius;
-        float offsetX = radius * std::cos(angle);
-        float offsetZ = radius * std::sin(angle);
-        
-        Vec3 waterSurfacePos(pos.x + offsetX, 11.0f, pos.z + offsetZ);
-        
-        // Get water surface normal at this point
-        Vec3 waterNormal = getWaterNormal(waterSurfacePos, time);
-        
-        // Calculate refracted ray direction through Snell's law
-        Vec3 incident = sun.direction;
-        float n1 = 1.0f;    // air
-        float n2 = 1.333f;  // water
-        float ratio = n1 / n2;
-        
-        float cosI = -waterNormal.dot(incident);
-        
-        // Handle edge case where ray grazes surface
-        if (cosI < 0.01f) continue;
-        
-        float sinT2 = ratio * ratio * (1.0f - cosI * cosI);
-        
-        if (sinT2 <= 1.0f) {
-            float cosT = std::sqrt(1.0f - sinT2);
-            Vec3 refracted = incident * ratio + waterNormal * (ratio * cosI - cosT);
-            refracted = refracted.normalize();
-            
-            // Check if refracted ray hits near our position
-            if (refracted.y < -0.01f) {  // Ray must be going down
-                float t = (pos.y - waterSurfacePos.y) / refracted.y;
-                Vec3 hitPos = waterSurfacePos + refracted * t;
-                
-                float distance = std::sqrt((hitPos.x - pos.x) * (hitPos.x - pos.x) + 
-                                          (hitPos.z - pos.z) * (hitPos.z - pos.z));
-                
-                // Gaussian falloff for smooth caustics
-                float contribution = std::exp(-distance * distance * 4.0f);
-                
-                // Add focusing factor based on normal deviation
-                float focusFactor = 1.0f + (1.0f - std::abs(waterNormal.y)) * 2.0f;
-                contribution *= focusFactor;
-                
-                causticIntensity += contribution;
-            }
+    // 8 samples per iteration: stratified sample points, water normals, Snell
+    // refraction and Gaussian falloff all run 8-wide (sample counts 8/16/32 are
+    // multiples of 8). Lanes that graze the surface, totally internally reflect
+    // or refract upward are masked out of the sum, matching the scalar branches.
+    const Vec3 incident = sun.direction;
+    const float ratio = 1.0f / 1.333f;   // air -> water
+    const F8 laneIdx(_mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7));
+    alignas(32) float rndA[8], rndB[8];
+
+    for (int i = 0; i < samples; i += 8) {
+        for (int k = 0; k < 8; k++) {
+            rndA[k] = random01();
+            rndB[k] = random01();
         }
+
+        // Sample points on the water surface above (stratified)
+        F8 angle = (F8(float(i)) + laneIdx + F8::load(rndA)) * F8(2.0f * float(M_PI) / float(samples));
+        F8 radius = sqrt8(F8::load(rndB)) * F8(sampleRadius);
+        F8 sinA, cosA;
+        sincos8(angle, sinA, cosA);
+        F8 wx = F8(pos.x) + radius * cosA;
+        F8 wz = F8(pos.z) + radius * sinA;
+
+        F8 nx, ny, nz;
+        waterNormal8(wx, wz, time, nx, ny, nz);
+
+        // Snell's law per lane
+        F8 cosI = -(nx * F8(incident.x) + ny * F8(incident.y) + nz * F8(incident.z));
+        F8 valid = cmpge8(cosI, F8(0.01f));                  // grazing rays drop out
+
+        F8 sinT2 = F8(ratio * ratio) * (F8(1.0f) - cosI * cosI);
+        valid = and8(valid, cmple8(sinT2, F8(1.0f)));        // total internal reflection drops out
+
+        F8 cosT = sqrt8(max8(F8(1.0f) - sinT2, F8(0.0f)));
+        F8 rc = F8(ratio) * cosI - cosT;
+        F8 rx = F8(incident.x * ratio) + nx * rc;
+        F8 ry = F8(incident.y * ratio) + ny * rc;
+        F8 rz = F8(incident.z * ratio) + nz * rc;
+        F8 invLen = F8(1.0f) / max8(sqrt8(rx * rx + ry * ry + rz * rz), F8(1e-20f));
+        rx = rx * invLen;
+        ry = ry * invLen;
+        rz = rz * invLen;
+        valid = and8(valid, cmplt8(ry, F8(-0.01f)));         // ray must be going down
+
+        // Where the refracted ray crosses our depth; Gaussian falloff + focusing
+        F8 t = (F8(pos.y) - F8(11.0f)) / min8(ry, F8(-1e-20f));
+        F8 dx = wx + rx * t - F8(pos.x);
+        F8 dz = wz + rz * t - F8(pos.z);
+        F8 contribution = exp8((dx * dx + dz * dz) * F8(-4.0f));
+        contribution = contribution * (F8(1.0f) + (F8(1.0f) - abs8(ny)) * F8(2.0f));
+
+        causticIntensity += hsum8(and8(contribution, valid));
     }
     
     // Normalize by sample count

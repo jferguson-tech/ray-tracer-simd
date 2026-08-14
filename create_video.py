@@ -44,8 +44,8 @@ def ppm_to_bgr_fast(ppm_file: str) -> tuple:
             remaining = mmapped_file.read()
             
     # Parse all numbers at once using numpy
-    # This is much faster than line-by-line parsing
-    pixels = np.fromstring(remaining.decode('ascii'), dtype=np.uint8, sep=' ')
+    # (np.fromstring was removed in NumPy 2.x; split+array works on 1.x and 2.x)
+    pixels = np.array(remaining.decode('ascii').split(), dtype=np.uint8)
     
     # Reshape to image
     img = pixels.reshape((height, width, 3))
@@ -78,8 +78,9 @@ def ppm_to_bgr_fastest(ppm_file: str) -> tuple:
     # Join all pixel lines and parse at once
     pixel_data = ' '.join(lines[3:])
     
-    # Use numpy to parse all numbers at once - VERY fast
-    pixels = np.fromstring(pixel_data, dtype=np.uint8, sep=' ')
+    # Use numpy to parse all numbers at once
+    # (np.fromstring was removed in NumPy 2.x; split+array works on 1.x and 2.x)
+    pixels = np.array(pixel_data.split(), dtype=np.uint8)
     
     # Reshape and convert
     img = pixels.reshape((height, width, 3))
