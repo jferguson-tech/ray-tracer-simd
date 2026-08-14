@@ -5,15 +5,30 @@ High-performance C++ path tracer with SIMD acceleration.
 ![Path Tracer Demo](pathtracer.gif)
 
 ## Features
-- AVX/SIMD optimization for 4x+ speedup
-- OpenMP multi-threading
+- AVX2 SIMD acceleration: measured 1.9-2.2x whole-frame speedup (3-5x in the vectorized subsystems)
+- 8-wide packet ray marching for volumetric shadow rays, vectorized caustics/noise kernels, SSE-backed Vec3
+- Multi-threaded tile renderer (std::thread)
 - Multiple materials (diffuse, metal, dielectric)
-- JSON scene description
+- JSON demo/camera path playback and offline rendering
+
+## Performance
+
+Measured at 128 samples/pixel, offline mode, AMD Ryzen AI 9 HX 370 (12C/24T, MSVC /O2 /arch:AVX2):
+
+| View | Resolution | Scalar | SIMD | Speedup |
+|---|---|---|---|---|
+| Lake | 640x360 | 26.3 s | 14.2 s | 1.85x |
+| Lake | 1280x720 | 104.8 s | 55.0 s | 1.90x |
+| River valley | 640x360 | 40.4 s | 18.1 s | 2.23x |
+| River valley | 1280x720 | 160.6 s | 71.6 s | 2.24x |
+
+Output is identical to the scalar renderer within path-tracing noise (~47 dB PSNR
+against a scalar reference, at the run-to-run noise floor).
 
 ## Build & Run
 ```bash
 # Build the pathtracer
-g++ -O3 -fopenmp -mavx2 trace.cpp -o pathtracer
+g++ -O3 -mavx2 -std=c++17 trace.cpp -o pathtracer -lSDL2
 
 # Run with default scene (built into the code)
 ./pathtracer
@@ -55,7 +70,9 @@ python create_video.py --benchmark
 ```
 
 ## Technical Highlights
-- Custom Vec3 with SIMD operations
+- Custom Vec3 backed by SSE registers; 8-wide AVX2 sin/cos/exp kernels (no FMA required)
+- Caustics sampling, volumetric scattering and value-noise textures vectorized 8-wide
+- Volumetric shadow rays marched as 8-wide SIMD packets through the voxel DDA
 - Physically-based BRDF
 - Stratified sampling
 - BVH acceleration (planned)
