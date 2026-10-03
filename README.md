@@ -8,8 +8,9 @@ High-performance C++ path tracer with SIMD acceleration.
 - AVX2 SIMD acceleration: measured 1.9-2.2x whole-frame speedup (3-5x in the vectorized subsystems)
 - 8-wide packet ray marching for volumetric shadow rays, vectorized caustics/noise kernels, SSE-backed Vec3
 - Multi-threaded tile renderer (std::thread)
-- Multiple materials (diffuse, metal, dielectric)
-- JSON demo/camera path playback and offline rendering
+- Voxel world with procedurally textured terrain, refractive and reflective water, and emissive light blocks
+- Sun and sky lighting, water caustics and volumetric light shafts
+- Camera path recording, playback, benchmarking and offline rendering (JSON)
 
 ## Performance
 
@@ -26,30 +27,58 @@ Output is identical to the scalar renderer within path-tracing noise (~47 dB PSN
 against a scalar reference, at the run-to-run noise floor).
 
 ## Build & Run
+
+### Windows (Visual Studio)
+```bat
+build_windows.bat          :: build pathtracer.exe
+build_windows.bat run      :: build, then start the interactive viewer
+```
+Needs Visual Studio 2019 or 2022 with "Desktop development with C++". The script
+finds the compiler itself, and on the first run downloads the official SDL2
+development package into `third_party/` (checksum verified).
+
+### Linux
 ```bash
-# Build the pathtracer
-g++ -O3 -mavx2 -std=c++17 trace.cpp -o pathtracer -lSDL2
-
-# Run with default scene (built into the code)
+g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 ./pathtracer
-
-# Run with custom JSON scene
-./pathtracer my_scene.json
-
-# Create video from rendered frames
-python create_video.py
 ```
 
 ## Command-Line Options
-
-### Pathtracer
 ```bash
-# Default scene (no arguments)
-./pathtracer
-
-# Custom scene file
-./pathtracer demo.json
+./pathtracer                         # interactive viewer
+./pathtracer demo.json --play        # play a recorded camera path in the window
+./pathtracer --benchmark             # play demo.json and write benchmark_results.json
+./pathtracer --offline --samples 128 --resolution 5   # render demo.json to output/frame_NNNNN.ppm
+./pathtracer --help
 ```
+
+| Option | Meaning |
+|---|---|
+| `demo.json` or `--demo <file>` | Camera path file to load (default `demo.json`). This is a camera path, not a scene: the world is generated from a seed. |
+| `--play` | Play the camera path in the window |
+| `--benchmark` | Play the camera path and write `benchmark_results.json` |
+| `--offline` | Render the camera path to `output/` at 30 frames per second, without a window |
+| `--samples <n>` | Samples per pixel for each offline frame (default 1000) |
+| `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
+| `--caustic-quality <1-3>` | 8, 16 or 32 caustic samples (default 3) |
+
+### Controls (interactive)
+| Keys | Action |
+|---|---|
+| `W` `A` `S` `D`, `Space`, `Shift`, mouse | Move and look |
+| `1` to `6` | Render resolution |
+| `Q` / `E` | Window size |
+| `R` / `F` | New random world / next seed |
+| `T` / `G` | Time of day |
+| `F1` | Start or stop recording a camera path |
+| `F2` / `F3` | Play the path / benchmark it |
+| `F5` / `F6` | Save / load the path |
+| Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic quality |
+| `Esc` | Quit |
+
+The water animates while the view is changing and holds still while a still
+view accumulates samples, so the image converges. In offline renders the water
+follows each frame's time, so its speed does not depend on `--samples`.
 
 ### Video Creation
 ```bash
@@ -73,9 +102,8 @@ python create_video.py --benchmark
 - Custom Vec3 backed by SSE registers; 8-wide AVX2 sin/cos/exp kernels (no FMA required)
 - Caustics sampling, volumetric scattering and value-noise textures vectorized 8-wide
 - Volumetric shadow rays marched as 8-wide SIMD packets through the voxel DDA
-- Physically-based BRDF
-- Stratified sampling
-- BVH acceleration (planned)
+- Voxel grid traversal (3D DDA); rays that start outside the world are clipped to it
+- Stratified sampling of the water surface for caustics
 
 ## Requirements
 ```bash
