@@ -1156,7 +1156,6 @@ class World {
     // a cell means "a ray toward the sun passing through here cannot hit any
     // block". Written by the main thread before the render threads start; they
     // only read it.
-    static constexpr uint8_t SUN_CLEAR = 0x80;
     mutable std::vector<uint8_t> sunBlocks;
     mutable Vec3 sunClearDir;
     mutable uint64_t sunClearGeneration = 0;
@@ -1415,6 +1414,13 @@ public:
         sunClearValid = true;
     }
 
+    static constexpr uint8_t SUN_CLEAR = 0x80;      // flag bit in the sun grid (see prepareSunShadows)
+
+    static inline bool inWorld(int x, int y, int z) {
+        return x >= 0 && x < WORLD_SIZE && y >= 0 && y < WORLD_HEIGHT && z >= 0 && z < WORLD_SIZE;
+    }
+    static inline int cellIndex(int x, int y, int z) { return x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT; }
+
     // The grid to march through for a ray in direction `dir`: the flagged copy
     // toward the sun, the plain grid otherwise (no cell is flagged there)
     inline const uint8_t* gridFor(const Vec3& dir) const {
@@ -1566,6 +1572,12 @@ public:
         int idx = x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT;
         const int idxStepX = stepX, idxStepY = stepY * WORLD_SIZE, idxStepZ = stepZ * WORLD_SIZE * WORLD_HEIGHT;
         int axis = -1;              // axis of the last step: the face the ray came in through (-1: none yet)
+        // Only the coordinate that just stepped can leave the world, so each
+        // step compares that one against its end value.
+        const int xEnd = stepX > 0 ? WORLD_SIZE : -1;
+        const int yEnd = stepY > 0 ? WORLD_HEIGHT : -1;
+        const int zEnd = stepZ > 0 ? WORLD_SIZE : -1;
+        bool aboveTop = stepY > 0 && y > topY;      // rising above every block: open sky
         auto hit = [&](BlockType block) {
             hitPos = pos + dir * dist;
             hitBlock = block;
@@ -1588,12 +1600,14 @@ public:
                     dist = tMaxX;
                     tMaxX += tDeltaX;
                     axis = 0;
+                    if (x == xEnd) break;
                 } else {
                     z += stepZ;
                     idx += idxStepZ;
                     dist = tMaxZ;
                     tMaxZ += tDeltaZ;
                     axis = 2;
+                    if (z == zEnd) break;
                 }
             } else {
                 if (tMaxY < tMaxZ) {
@@ -1602,19 +1616,18 @@ public:
                     dist = tMaxY;
                     tMaxY += tDeltaY;
                     axis = 1;
+                    if (y == yEnd) break;
+                    aboveTop = stepY > 0 && y > topY;
                 } else {
                     z += stepZ;
                     idx += idxStepZ;
                     dist = tMaxZ;
                     tMaxZ += tDeltaZ;
                     axis = 2;
+                    if (z == zEnd) break;
                 }
             }
-
-            if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) {
-                break;
-            }
-            if (stepY > 0 && y > topY) break;       // rising above every block: open sky
+            if (aboveTop) break;
         }
 
         return false;
@@ -1648,21 +1661,31 @@ public:
         float tDeltaY = (dir.y != 0) ? stepY / dir.y : 1e30f;
         float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
 
+        int idx = x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT;
+        const int idxStepX = stepX, idxStepY = stepY * WORLD_SIZE, idxStepZ = stepZ * WORLD_SIZE * WORLD_HEIGHT;
+        const int xEnd = stepX > 0 ? WORLD_SIZE : -1;
+        const int yEnd = stepY > 0 ? WORLD_HEIGHT : -1;
+        const int zEnd = stepZ > 0 ? WORLD_SIZE : -1;
+        bool aboveTop = stepY > 0 && y > topY;      // rising above every block: open sky
+
         float dist = 0;
         while (dist < maxDist) {
-            uint8_t block = grid[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT];
+            uint8_t block = grid[idx];
             if (block & SUN_CLEAR) return AIR;      // toward the sun, above everything in the way
             if (block != AIR && block != WATER) return static_cast<BlockType>(block);
 
             if (tMaxX < tMaxY && tMaxX < tMaxZ) {
-                x += stepX; dist = tMaxX; tMaxX += tDeltaX;
+                x += stepX; idx += idxStepX; dist = tMaxX; tMaxX += tDeltaX;
+                if (x == xEnd) break;
             } else if (tMaxY < tMaxZ) {
-                y += stepY; dist = tMaxY; tMaxY += tDeltaY;
+                y += stepY; idx += idxStepY; dist = tMaxY; tMaxY += tDeltaY;
+                if (y == yEnd) break;
+                aboveTop = stepY > 0 && y > topY;
             } else {
-                z += stepZ; dist = tMaxZ; tMaxZ += tDeltaZ;
+                z += stepZ; idx += idxStepZ; dist = tMaxZ; tMaxZ += tDeltaZ;
+                if (z == zEnd) break;
             }
-            if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) break;
-            if (stepY > 0 && y > topY) break;       // rising above every block: open sky
+            if (aboveTop) break;
         }
         return AIR;
     }
@@ -1817,17 +1840,31 @@ public:
         return getRight().cross(getForward()).normalize();
     }
     
-    Ray getRay(float u, float v, float aspectRatio) const {
+    // Everything a camera ray needs that is the same for the whole pass
+    struct RayBasis {
+        Vec3 position, forward, right, up;
+        float halfWidth, halfHeight;
+    };
+
+    RayBasis rayBasis(float aspectRatio) const {
+        RayBasis b;
         float fovRad = FOV * M_PI / 180.0f;
-        float halfHeight = std::tan(fovRad / 2);
-        float halfWidth = aspectRatio * halfHeight;
-        
-        Vec3 forward = getForward();
-        Vec3 right = getRight();
-        Vec3 up = getUp();
-        
-        Vec3 direction = forward + right * (u * halfWidth) + up * (v * halfHeight);
-        return Ray(position, direction.normalize());
+        b.halfHeight = std::tan(fovRad / 2);
+        b.halfWidth = aspectRatio * b.halfHeight;
+        b.position = position;
+        b.forward = getForward();
+        b.right = getRight();
+        b.up = getUp();
+        return b;
+    }
+
+    static Ray rayFrom(const RayBasis& b, float u, float v) {
+        Vec3 direction = b.forward + b.right * (u * b.halfWidth) + b.up * (v * b.halfHeight);
+        return Ray(b.position, direction.normalize());
+    }
+
+    Ray getRay(float u, float v, float aspectRatio) const {
+        return rayFrom(rayBasis(aspectRatio), u, v);
     }
     
     void setFromKeyframe(float x, float y, float z, float yaw, float pitch) {
@@ -1883,10 +1920,23 @@ inline void waterNormal8(F8 px, F8 pz, float time, F8& nx, F8& ny, F8& nz) {
 }
 
 // Water surface normal (pointing up) at one point
+// (one lane per wave, instead of eight lanes of the same point per wave; the
+// arithmetic per wave and the order of the sum match waterSlope8 exactly)
 inline Vec3 getWaterNormal(const Vec3& pos, float time) {
-    F8 dx, dz;
-    waterSlope8(F8(pos.x), F8(pos.z), time, dx, dz);
-    return Vec3(-_mm256_cvtss_f32(dx.v), 1.0f, -_mm256_cvtss_f32(dz.v)).normalize();
+    alignas(32) float phase[8], cosine[8];
+    for (int i = 0; i < 8; i++) {
+        const WaterWave& w = g_waterWaves[i];
+        phase[i] = pos.x * w.kx + pos.z * w.kz + time * w.speed;
+    }
+    F8 s, c;
+    sincos8(F8::load(phase), s, c);
+    c.store(cosine);
+    float dx = 0.0f, dz = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        dx = dx + g_waterWaves[i].slopeX * cosine[i];
+        dz = dz + g_waterWaves[i].slopeZ * cosine[i];
+    }
+    return Vec3(-dx, 1.0f, -dz).normalize();
 }
 
 // Get sky color
@@ -2199,9 +2249,16 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     // Water is murkier than air, so its shafts are sampled over a shorter stretch
     float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
 
-    // Jittered sample positions along the ray (SoA, padded to 2 groups of 8)
+    // Jittered sample positions along the ray (SoA, padded to 2 groups of 8).
+    // The block at each sample is read from the grid used for sun shadow rays:
+    // besides telling water from air, its flag says when the sample is above
+    // everything between it and the sun, so no shadow ray is needed for it (a
+    // march from that cell would stop at once with the same answer).
+    Vec3 toSun = -sun.direction;
+    const uint8_t* sunGrid = world.gridFor(toSun);
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
-    bool laneActive[16];
+    bool laneActive[16];        // the sample is in this ray's medium
+    bool needsMarch[16];        // ... and its view of the sun has to be traced
     for (int i = 0; i < evaluated; i++) {
         float t = stepSize * (firstStep + i + random01() * 0.5f);
         Vec3 samplePos = ray.at(t);
@@ -2209,30 +2266,36 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         sx[i] = samplePos.x;
         sy[i] = samplePos.y;
         sz[i] = samplePos.z;
-        bool sampleInWater = (world.getBlock(static_cast<int>(std::floor(samplePos.x)),
-                                            static_cast<int>(std::floor(samplePos.y)),
-                                            static_cast<int>(std::floor(samplePos.z))) == WATER);
+        int cx = static_cast<int>(std::floor(samplePos.x));
+        int cy = static_cast<int>(std::floor(samplePos.y));
+        int cz = static_cast<int>(std::floor(samplePos.z));
+        uint8_t cell = World::inWorld(cx, cy, cz) ? sunGrid[World::cellIndex(cx, cy, cz)] : uint8_t(AIR);
+        bool sampleInWater = (cell & ~World::SUN_CLEAR) == WATER;
         laneActive[i] = (sampleInWater == inWater);
+        needsMarch[i] = laneActive[i] && !(cell & World::SUN_CLEAR);
     }
     const int groups = (evaluated + 7) / 8;
     for (int i = evaluated; i < groups * 8; i++) {      // pad the last group of 8
         ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
         laneActive[i] = false;
+        needsMarch[i] = false;
     }
 
     // How much sun reaches each sample: 1, 0.3 through leaves, 0 behind solid blocks
-    Vec3 toSun = -sun.direction;
     alignas(32) float visible[16];
     bool anyVisible = false;
     for (int group = 0; group < groups; group++) {
         int base = group * 8;
         uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int marching = 0;
+        for (int L = 0; L < 8; L++) marching += needsMarch[base + L] ? 1 : 0;
+        for (int L = 0; L < 8; L++) t_rayCount += (laneActive[base + L] && !needsMarch[base + L]) ? 1 : 0;
         if (evaluated == 1) {
             // A packet with one live lane costs almost a full packet; use a plain ray.
-            if (laneActive[0]) hitBlock[0] = world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, 100.0f);
-        } else {
+            if (marching) hitBlock[0] = world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, 100.0f);
+        } else if (marching) {
             world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
-                                 laneActive + base, hitBlock);
+                                 needsMarch + base, hitBlock);
         }
         for (int L = 0; L < 8; L++) {
             uint8_t hb = hitBlock[L];
@@ -2551,6 +2614,7 @@ public:
 
     void renderThread(const Camera& camera, const World& world, bool cameraUnderwater) {
         float aspectRatio = float(currentWidth) / currentHeight;
+        const Camera::RayBasis basis = camera.rayBasis(aspectRatio);
         const uint64_t passSeed = frameSeed * 0x9E3779B97F4A7C15ULL + uint64_t(sampleCount);
         t_rayCount = 0;
         int tilesX = (currentWidth + TILE_SIZE - 1) / TILE_SIZE;
@@ -2577,7 +2641,7 @@ public:
                         float u = (x + random01() - currentWidth/2.0f) / (currentWidth/2.0f);
                         float v = -(y + random01() - currentHeight/2.0f) / (currentHeight/2.0f);
                         
-                        Ray ray = camera.getRay(u, v, aspectRatio);
+                        Ray ray = Camera::rayFrom(basis, u, v);
                         color = color + trace(ray, world, MAX_BOUNCES, cameraUnderwater, true);
                     }
                     

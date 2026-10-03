@@ -33,6 +33,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      # SDL2 is kept between runs, so the build does not depend on a download
+      - uses: actions/cache@v4
+        with:
+          path: third_party
+          key: sdl2-${{ hashFiles('build_windows.bat') }}
       - name: Build
         shell: cmd
         run: build_windows.bat
