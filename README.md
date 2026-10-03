@@ -11,7 +11,8 @@ High-performance C++ path tracer with SIMD acceleration.
 - 8-wide packet ray marching for volumetric shadow rays, vectorized caustics/noise kernels, SSE-backed Vec3
 - Multi-threaded tile renderer (std::thread)
 - Voxel world with procedurally textured terrain, refractive and reflective water, and emissive light blocks
-- Sun and sky lighting, water caustics and volumetric light shafts
+- Sun and sky lighting, water caustics and volumetric light shafts, above and below the water
+- Light blocks are sampled directly, so lamp-lit areas converge quickly
 - Camera path recording, playback, benchmarking and offline rendering (JSON)
 - Repeatable renders: the same command produces the same image, on any number of threads
 
@@ -67,8 +68,10 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
 | `--threads <n>` | Render threads (default: all) |
 | `--seed <n>` | World seed (default 42) |
+| `--time <0-1>` | Time of day (default 0.85; 0.5 is midday) |
 | `--caustic-quality <1-3>` | 8, 16 or 32 caustic samples (default 3) |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
+| `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
 
 ### Fixed benchmark
 `--bench` renders five fixed views (lake, shore, underwater, lake bed, aerial) at
@@ -89,12 +92,12 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 1.16 | 180 |
-| shore | 1.15 | 195 |
-| underwater | 0.98 | 169 |
-| lakebed | 1.48 | 192 |
-| aerial | 0.56 | 281 |
-| total | 5.33 | 195 |
+| lake | 1.23 | 172 |
+| shore | 1.23 | 182 |
+| underwater | 1.16 | 145 |
+| lakebed | 1.61 | 178 |
+| aerial | 0.63 | 256 |
+| total | 5.85 | 179 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -147,6 +150,12 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
 - Volumetric shadow rays marched as 8-wide SIMD packets through the voxel DDA
 - Effects run at full quality on what the camera sees (directly or through water) and with
   one random sample on indirect bounces; rays rising above the highest block stop early
+- Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
+  multiple importance sampling) and one cosine-weighted bounce that gathers sky and surface light
+- Water: Fresnel reflection and refraction, split on camera rays and chosen by probability on
+  indirect paths. Sunlight passes through the surface, so light shafts and the shadows of
+  blocks above the water show underwater. Scattering inside the water is not simulated:
+  underwater surfaces use a dimmed bounce plus a depth-faded blue ambient
 - Voxel grid traversal (3D DDA); rays that start outside the world are clipped to it
 - Stratified sampling of the water surface for caustics
 
