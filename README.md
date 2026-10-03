@@ -1,5 +1,7 @@
 # Path Tracer
 
+[![build](https://github.com/jferguson-tech/ray-tracer-simd/actions/workflows/build.yml/badge.svg)](https://github.com/jferguson-tech/ray-tracer-simd/actions/workflows/build.yml)
+
 High-performance C++ path tracer with SIMD acceleration.
 
 ![Path Tracer Demo](pathtracer.gif)

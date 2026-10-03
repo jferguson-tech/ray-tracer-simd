@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The jobs only read the code; the token they get cannot push or edit anything.
+permissions:
+  contents: read
+
+env:
+  # No display on the runners: SDL's dummy video driver lets offline mode start.
+  SDL_VIDEODRIVER: dummy
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install SDL2
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+      - name: Build
+        run: g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
+      - name: Render two frames
+        run: |
+          ./pathtracer --offline --demo tests/smoke.json --samples 4 --resolution 1
+          test "$(ls output/frame_*.ppm | wc -l)" -ge 2
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        shell: cmd
+        run: build_windows.bat
+      - name: Render two frames
+        shell: bash
+        run: |
+          ./pathtracer.exe --offline --demo tests/smoke.json --samples 4 --resolution 1
+          test "$(ls output/frame_*.ppm | wc -l)" -ge 2
