@@ -448,6 +448,7 @@ struct Settings {
     bool showUI = true;
     bool enableCaustics = true;
     bool enableVolumetrics = true;
+    bool sampleLamps = true;          // sample light blocks directly (off: found by bounces only)
     int causticQuality = 3;  // 1=low (8 samples), 2=medium (16 samples), 3=high (32 samples)
     
     // New settings for recording/playback
@@ -762,15 +763,19 @@ inline float random01() { return (rng.next() >> 8) * (1.0f / 16777216.0f); }
 // Rays traced by the current thread (grid marches, shadow tests, packet lanes)
 thread_local uint64_t t_rayCount = 0;
 
-inline Vec3 randomInHemisphere(const Vec3& normal) {
-    Vec3 dir;
-    do {
-        dir = Vec3(random01() * 2 - 1, random01() * 2 - 1, random01() * 2 - 1);
-    } while (dir.dot(dir) > 1);
-    
-    dir = dir.normalize();
-    if (dir.dot(normal) < 0) dir = dir * -1;
-    return dir;
+// Uniform direction on the unit sphere
+inline Vec3 randomUnitVector() {
+    float z = random01() * 2.0f - 1.0f;
+    float phi = random01() * 2.0f * float(M_PI);
+    float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+    return Vec3(r * std::cos(phi), r * std::sin(phi), z);
+}
+
+// Cosine-weighted direction around a surface normal (the diffuse bounce:
+// probability density cos(theta) / pi)
+inline Vec3 randomCosineDirection(const Vec3& normal) {
+    Vec3 dir = normal + randomUnitVector();
+    return dir.dot(dir) > 1e-8f ? dir.normalize() : normal;
 }
 
 // Simple hash function for procedural noise
@@ -1014,6 +1019,7 @@ class World {
     std::vector<uint8_t> blocks;
     int seed;
     int topY = WORLD_HEIGHT - 1;      // highest y that holds any block
+    std::vector<Vec3i> lights;        // every LIGHT block
     
     float getTerrainHeight(int x, int z) const {
         float height = 12;
@@ -1160,8 +1166,60 @@ public:
             for (int y = 0; y < WORLD_HEIGHT; y++)
                 for (int x = 0; x < WORLD_SIZE; x++)
                     if (getBlock(x, y, z) != AIR) topY = std::max(topY, y);
+        buildLightCells();
     }
     
+    // Light blocks near a point, for sampling their light directly. Each
+    // 8-block cell lists the light blocks closest to it (within LIGHT_RANGE).
+    static constexpr int LIGHT_CELL = 8;
+    static constexpr int MAX_CELL_LIGHTS = 8;
+    static constexpr int CELLS_X = WORLD_SIZE / LIGHT_CELL;
+    static constexpr int CELLS_Y = WORLD_HEIGHT / LIGHT_CELL;
+    static constexpr int CELLS_Z = WORLD_SIZE / LIGHT_CELL;
+    struct LightCell {
+        int count = 0;
+        int index[MAX_CELL_LIGHTS];
+    };
+
+    const LightCell& lightsNear(const Vec3& p) const {
+        int cx = std::min(CELLS_X - 1, std::max(0, static_cast<int>(p.x) / LIGHT_CELL));
+        int cy = std::min(CELLS_Y - 1, std::max(0, static_cast<int>(p.y) / LIGHT_CELL));
+        int cz = std::min(CELLS_Z - 1, std::max(0, static_cast<int>(p.z) / LIGHT_CELL));
+        return lightCells[cx + cy * CELLS_X + cz * CELLS_X * CELLS_Y];
+    }
+    const Vec3i& light(int i) const { return lights[i]; }
+
+    std::vector<LightCell> lightCells;
+
+    void buildLightCells() {
+        const float LIGHT_RANGE = 28.0f;
+        lights.clear();
+        for (int z = 0; z < WORLD_SIZE; z++)
+            for (int y = 0; y < WORLD_HEIGHT; y++)
+                for (int x = 0; x < WORLD_SIZE; x++)
+                    if (getBlock(x, y, z) == LIGHT) lights.emplace_back(x, y, z);
+
+        lightCells.assign(CELLS_X * CELLS_Y * CELLS_Z, LightCell());
+        std::vector<std::pair<float, int>> closest;
+        for (int cz = 0; cz < CELLS_Z; cz++) {
+            for (int cy = 0; cy < CELLS_Y; cy++) {
+                for (int cx = 0; cx < CELLS_X; cx++) {
+                    float px = (cx + 0.5f) * LIGHT_CELL, py = (cy + 0.5f) * LIGHT_CELL, pz = (cz + 0.5f) * LIGHT_CELL;
+                    closest.clear();
+                    for (int i = 0; i < static_cast<int>(lights.size()); i++) {
+                        float dx = lights[i].x + 0.5f - px, dy = lights[i].y + 0.5f - py, dz = lights[i].z + 0.5f - pz;
+                        float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        if (d < LIGHT_RANGE) closest.emplace_back(d, i);
+                    }
+                    std::sort(closest.begin(), closest.end());
+                    LightCell& cell = lightCells[cx + cy * CELLS_X + cz * CELLS_X * CELLS_Y];
+                    cell.count = std::min(MAX_CELL_LIGHTS, static_cast<int>(closest.size()));
+                    for (int k = 0; k < cell.count; k++) cell.index[k] = closest[k].second;
+                }
+            }
+        }
+    }
+
     inline BlockType getBlock(int x, int y, int z) const {
         if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE)
             return AIR;
@@ -1304,15 +1362,15 @@ public:
         return false;
     }
 
-    // Sun shadow test: true if a solid block lies between `origin` and the sun.
-    // Water is transparent here, so blocks above a lake shade its bed and a
-    // ray that reaches open sky is never read as blocked.
-    bool sunOccluded(const Vec3& origin, const Vec3& dir, float maxDist) const {
+    // First solid block along a ray, or AIR if there is none within maxDist.
+    // Water is transparent here: light passes through it, so blocks above a
+    // lake shade its bed and a ray that reaches open sky is never read as blocked.
+    BlockType firstSolid(const Vec3& origin, const Vec3& dir, float maxDist) const {
         t_rayCount++;
         Vec3 pos = origin;
         Vec3 normal;
         float entryDist;
-        if (!enterWorld(pos, dir, maxDist, entryDist, normal)) return false;
+        if (!enterWorld(pos, dir, maxDist, entryDist, normal)) return AIR;
         maxDist -= entryDist;
 
         int x = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.x))));
@@ -1334,7 +1392,7 @@ public:
         float dist = 0;
         while (dist < maxDist) {
             BlockType block = static_cast<BlockType>(blocks[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT]);
-            if (block != AIR && block != WATER) return true;
+            if (block != AIR && block != WATER) return block;
 
             if (tMaxX < tMaxY && tMaxX < tMaxZ) {
                 x += stepX; dist = tMaxX; tMaxX += tDeltaX;
@@ -1346,28 +1404,30 @@ public:
             if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) break;
             if (stepY > 0 && y > topY) break;       // rising above every block: open sky
         }
-        return false;
+        return AIR;
     }
 
-    // First block a shadow ray hits, with the same rules as raycastShadow8 for
-    // one ray: WATER means it crossed a water surface, AIR that nothing was hit.
+    // Sun shadow test: true if a solid block lies between `origin` and the sun.
+    bool sunOccluded(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        return firstSolid(origin, dir, maxDist) != AIR;
+    }
+
+    // First solid block a volumetric shadow ray hits (AIR if none): the
+    // one-ray version of raycastShadow8, with the same rules.
     uint8_t shadowBlock(const Vec3& origin, const Vec3& dir, float maxDist) const {
         if (origin.x < 0 || origin.x >= WORLD_SIZE || origin.y < 0 || origin.y >= WORLD_HEIGHT ||
             origin.z < 0 || origin.z >= WORLD_SIZE) {
             return AIR;                             // the packet version does not enter from outside
         }
-        Vec3 hitPos, hitNormal;
-        BlockType block;
-        raycast(Ray(origin, dir), maxDist, hitPos, hitNormal, block);
-        return block;
+        return firstSolid(origin, dir, maxDist);
     }
 
     // 8-wide shadow raycast: 8 origins, one shared direction (volumetric shadow
     // rays all point at the sun, so the DDA steps/deltas are uniform and only
     // per-lane voxel coords and tMax values diverge). Lanes march in lockstep
-    // with masked termination. Mirrors raycast() semantics: outBlock[i] is the
-    // first hit block (WATER = crossed a water surface), or AIR when nothing is
-    // hit within maxDist / the ray leaves the world.
+    // with masked termination. Water is transparent (sunlight passes through
+    // it): outBlock[i] is the first solid block, or AIR when nothing is hit
+    // within maxDist / the ray leaves the world.
     void raycastShadow8(const float* ox, const float* oy, const float* oz,
                         const Vec3& dirIn, float maxDist,
                         const bool laneActive[8], uint8_t outBlock[8]) const {
@@ -1418,7 +1478,6 @@ public:
             laneActive[4] ? -1 : 0, laneActive[5] ? -1 : 0, laneActive[6] ? -1 : 0, laneActive[7] ? -1 : 0);
         __m256i result = _mm256_setzero_si256();    // AIR = no hit
         for (int i = 0; i < 8; i++) t_rayCount += laneActive[i] ? 1 : 0;
-        __m256i inWater = _mm256_cmpeq_epi32(gatherBlocks(inBoundsMask()), waterV);
 
         for (int guard = 0; guard < 2048; guard++) {
             if (_mm256_movemask_ps(_mm256_castsi256_ps(active)) == 0) break;
@@ -1426,16 +1485,10 @@ public:
             __m256i block = gatherBlocks(inBoundsMask());
             __m256i isAir = _mm256_cmpeq_epi32(block, _mm256_setzero_si256());
             __m256i isWater = _mm256_cmpeq_epi32(block, waterV);
-            __m256i waterSurface = _mm256_or_si256(_mm256_and_si256(inWater, isAir),
-                                                   _mm256_andnot_si256(inWater, isWater));
             __m256i isSolid = _mm256_andnot_si256(_mm256_or_si256(isAir, isWater), minusOne);
-            __m256i hit = _mm256_and_si256(active, _mm256_or_si256(waterSurface, isSolid));
-            __m256i hitVal = _mm256_blendv_epi8(block, waterV, waterSurface);
-            result = _mm256_blendv_epi8(result, hitVal, hit);
+            __m256i hit = _mm256_and_si256(active, isSolid);
+            result = _mm256_blendv_epi8(result, block, hit);
             active = _mm256_andnot_si256(hit, active);
-
-            inWater = _mm256_blendv_epi8(inWater, minusOne, _mm256_and_si256(active, isWater));
-            inWater = _mm256_andnot_si256(_mm256_and_si256(active, isAir), inWater);
 
             // DDA step: same tie-breaking as the scalar version
             __m256 ltXY = _mm256_cmp_ps(tMaxX.v, tMaxY.v, _CMP_LT_OQ);
@@ -1578,7 +1631,9 @@ inline void waterNormal8(F8 px, F8 pz, float time, F8& nx, F8& ny, F8& nz) {
 }
 
 // Get sky color
-Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun) {
+// withSun adds the sun's disc and glow: for rays the camera sees. Bounce rays
+// leave it out, because surfaces already receive the sun as direct light.
+Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun, bool withSun = true) {
     float y = direction.y;
     float t = 0.5f * (y + 1.0f);
     
@@ -1598,7 +1653,8 @@ Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun) {
     }
     
     Vec3 skyGradient = horizonColor * (1 - t) + zenithColor * t;
-    
+    if (!withSun) return skyGradient;
+
     float sunDot = direction.dot(sun.direction);
     if (sunDot < -0.999f) {
         float sunGlow = std::pow((-sunDot - 0.999f) * 1000.0f, 2.0f);
@@ -1677,9 +1733,7 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
             if (!laneActive[base + L]) { lane[L] = 0.0f; continue; }
             uint8_t hb = hitBlock[L];
             float intensity = sun.intensity;
-            if (hb == AIR) {                          // nothing hit: sun fully visible
-            } else if (hb == WATER && !inWater) {
-                intensity *= 0.5f;
+            if (hb == AIR) {                          // nothing solid in the way: sun visible
             } else if (hb == LEAVES) {
                 intensity *= 0.3f;
             } else {
@@ -1837,8 +1891,17 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
 // cameraPath: the ray comes from the camera, directly or through water
 // refraction/reflection (not after a diffuse bounce). Effects run at full quality on it.
 // hitDistOut (optional) receives the distance this ray travelled to its first hit.
+// lampFrom/bouncePdf: set on a diffuse bounce ray. The surface at *lampFrom has
+// already sampled the nearby light blocks directly; if this ray then hits one of
+// them, its glow is weighted against that sample so the light is not counted twice.
 Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, bool cameraPath = false,
-           float* hitDistOut = nullptr);
+           float* hitDistOut = nullptr, const Vec3* lampFrom = nullptr, float bouncePdf = 0.0f);
+
+// Brightness of a light block (they are dimmer in the middle of the day)
+inline Vec3 lampEmission() {
+    float brightness = 0.3f + 0.7f * std::abs(g_settings.timeOfDay - 0.5f) * 2.0f;
+    return g_materials[LIGHT].emission * brightness;
+}
 
 // Minimal PNG writer: 8-bit RGB, stored (uncompressed) deflate blocks.
 // No external library; any viewer or video tool reads the result.
@@ -2061,7 +2124,8 @@ public:
 };
 
 // Complete trace function implementation
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath, float* hitDistOut) {
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath, float* hitDistOut,
+           const Vec3* lampFrom, float bouncePdf) {
     if (hitDistOut) *hitDistOut = 0.0f;
     if (depth <= 0) return Vec3(0, 0, 0);
     
@@ -2094,7 +2158,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
             return baseColor + volumetrics;
         }
         
-        Vec3 skyColor = getSkyColor(ray.direction, g_settings.timeOfDay, sun);
+        Vec3 skyColor = getSkyColor(ray.direction, g_settings.timeOfDay, sun, cameraPath);
         return skyColor + volumetrics;
     }
     
@@ -2131,43 +2195,56 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
         
         Vec3 offsetPos = hitPos + refractedDir * 0.01f;
         Ray refractedRay(offsetPos, refractedDir);
-        
         bool rayNowInsideWater = entering && !totalInternalReflection;
-        float waterDistance = 0.0f;                 // how far the refracted ray travels in the water
-        Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, cameraPath, &waterDistance);
-        
-        // Water absorption with tropical blue tint
-        if (entering && !totalInternalReflection) {
-            // Tropical blue-teal water color
-            Vec3 waterTint(0.05f, 0.25f, 0.35f);
-            float absorption = std::exp(-waterDistance * 0.08f);  // Stronger absorption for more color
-            transmitted = transmitted * absorption + waterTint * (1.0f - absorption) * 0.4f;
-        }
-        
+
         // Fresnel reflectance for water surface
         float r0 = ((n1 - n2) / (n1 + n2)) * ((n1 - n2) / (n1 + n2));
         float reflectance = r0 + (1.0f - r0) * std::pow(1.0f - std::abs(cosI), 5.0f);
-        
-        // Add reflections only when looking at water from above
+
+        // Reflections only when looking at water from above
+        bool reflects = false;
         if (!insideWater && !totalInternalReflection) {
             reflectance = std::min(reflectance, 0.8f);  // Reduced max reflectance for more water color
-            
-            if (reflectance > 0.02f) {
-                Vec3 reflectedDir = ray.direction - normal * 2.0f * ray.direction.dot(normal);
-                Ray reflectedRay(hitPos + normal * 0.01f, reflectedDir);
-                Vec3 reflected = trace(reflectedRay, world, depth - 1, false, cameraPath);
-                
-                // Mix in water color even with reflections
-                Vec3 waterColor(0.1f, 0.35f, 0.45f);
-                transmitted = transmitted * (1.0f - reflectance) + reflected * reflectance;
-                transmitted = transmitted * 0.9f + waterColor * 0.1f;  // Always show some water color
-                return transmitted + volumetrics;  // Add volumetrics
-            }
+            reflects = reflectance > 0.02f;
         }
-        
+
+        // A light block reached through the water was already sampled directly
+        // by the surface the ray came from (bouncePdf 0 drops its glow here).
+        auto traceTransmitted = [&]() {
+            float waterDistance = 0.0f;             // how far the refracted ray travels in the water
+            Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, cameraPath, &waterDistance,
+                                     lampFrom, 0.0f);
+            // Water absorption with tropical blue tint
+            if (entering && !totalInternalReflection) {
+                Vec3 waterTint(0.05f, 0.25f, 0.35f);
+                float absorption = std::exp(-waterDistance * 0.08f);  // Stronger absorption for more color
+                transmitted = transmitted * absorption + waterTint * (1.0f - absorption) * 0.4f;
+            }
+            return transmitted;
+        };
+        auto traceReflected = [&]() {
+            Vec3 reflectedDir = ray.direction - normal * 2.0f * ray.direction.dot(normal);
+            Ray reflectedRay(hitPos + normal * 0.01f, reflectedDir);
+            return trace(reflectedRay, world, depth - 1, false, cameraPath, nullptr, lampFrom, 0.0f);
+        };
+
+        Vec3 waterColor(0.1f, 0.35f, 0.45f);       // Always show some water color with reflections
+        if (reflects && !cameraPath) {
+            // Indirect paths follow one of the two, chosen by the reflectance:
+            // the same average as tracing both, at half the work.
+            Vec3 chosen = random01() < reflectance ? traceReflected() : traceTransmitted();
+            return chosen * 0.9f + waterColor * 0.1f + volumetrics;
+        }
+
+        Vec3 transmitted = traceTransmitted();
+        if (reflects) {
+            Vec3 reflected = traceReflected();
+            transmitted = transmitted * (1.0f - reflectance) + reflected * reflectance;
+            transmitted = transmitted * 0.9f + waterColor * 0.1f;
+        }
         return transmitted + volumetrics;  // Add volumetrics
     }
-    
+
     // Check if surface is underwater
     bool actuallyUnderwater = false;
     int checkX = static_cast<int>(std::floor(hitPos.x));
@@ -2186,17 +2263,35 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
     // Handle emissive materials
     Vec3 emission = mat.emission;
     if (hitBlock == LIGHT) {
-        float brightness = 0.3f + 0.7f * std::abs(g_settings.timeOfDay - 0.5f) * 2.0f;
-        emission = emission * brightness;
+        emission = lampEmission();
         if (isUnderwater) {
             float depth = std::max(0.0f, 11.0f - hitPos.y);
             emission = emission * (0.7f * std::exp(-depth * 0.03f));
         }
+        if (lampFrom) {
+            // This ray is a diffuse bounce, and the surface it left also sampled
+            // nearby light blocks directly. If this block was one of them, share
+            // the result between the two ways of finding it (power heuristic).
+            const World::LightCell& cell = world.lightsNear(*lampFrom);
+            Vec3 inside = hitPos - hitNormal * 0.5f;
+            int lx = static_cast<int>(std::floor(inside.x));
+            int ly = static_cast<int>(std::floor(inside.y));
+            int lz = static_cast<int>(std::floor(inside.z));
+            for (int i = 0; i < cell.count; i++) {
+                const Vec3i& L = world.light(cell.index[i]);
+                if (L.x == lx && L.y == ly && L.z == lz) {
+                    float cosLight = std::max(1e-4f, -hitNormal.dot(ray.direction));
+                    float lampPdf = hitDistance * hitDistance / (cosLight * cell.count * 6.0f);
+                    emission = emission * (bouncePdf * bouncePdf / (bouncePdf * bouncePdf + lampPdf * lampPdf));
+                    break;
+                }
+            }
+        }
     }
-    
+
     Vec3 color = emission;
-    
-    if (emission.x == 0 && emission.y == 0 && emission.z == 0) {
+
+    if (hitBlock != LIGHT) {
         // Get the base albedo from material properties
         Vec3 albedo = mat.albedo;
         
@@ -2248,22 +2343,61 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
             directLight = directLight + causticsColor * caustics * 0.8f;
         }
         
-        // Indirect lighting
-        Vec3 target = hitPos + hitNormal + randomInHemisphere(hitNormal);
-        Ray scattered(hitPos + hitNormal * 0.01f, (target - hitPos).normalize());
-        
-        float ambientStrength = isUnderwater ? 0.2f : (0.3f + 0.2f * sun.intensity);
-        Vec3 indirectLight = trace(scattered, world, depth - 1, isUnderwater, false) * ambientStrength;
-        
-        // Ambient term
-        Vec3 ambient = isUnderwater ? 
-            Vec3(0.05f, 0.15f, 0.22f) * (0.3f + 0.7f * std::exp(-std::max(0.0f, 11.0f - hitPos.y) * 0.05f)) :
-            Vec3(0.05f, 0.05f, 0.05f);
-        
+        // Direct light from nearby light blocks: one random point on one of them
+        Vec3 shadeOrigin = hitPos + hitNormal * 0.01f;
+        Vec3 lampLight(0, 0, 0);
+        const World::LightCell& cell = world.lightsNear(shadeOrigin);
+        if (g_settings.sampleLamps && cell.count > 0) {
+            const Vec3i& L = world.light(cell.index[std::min(cell.count - 1, int(random01() * cell.count))]);
+            int face = std::min(5, int(random01() * 6.0f));
+            int axis = face / 2;
+            float side = (face & 1) ? 1.0f : 0.0f;
+            float pt[3], faceNormal[3] = {0.0f, 0.0f, 0.0f};
+            pt[axis] = side;
+            pt[(axis + 1) % 3] = random01();
+            pt[(axis + 2) % 3] = random01();
+            faceNormal[axis] = side > 0.5f ? 1.0f : -1.0f;
+            Vec3 toLamp = Vec3(L.x + pt[0], L.y + pt[1], L.z + pt[2]) - shadeOrigin;
+            float dist2 = toLamp.dot(toLamp);
+            float dist = std::sqrt(dist2);
+            if (dist > 1e-3f) {
+                Vec3 wi = toLamp / dist;
+                float cosSurface = hitNormal.dot(wi);
+                float cosLight = -Vec3(faceNormal[0], faceNormal[1], faceNormal[2]).dot(wi);
+                if (cosSurface > 0.0f && cosLight > 0.0f &&
+                    world.firstSolid(shadeOrigin, wi, dist - 2e-3f) == AIR) {
+                    // Probability densities (per solid angle) of this direction for
+                    // the lamp sample and for the diffuse bounce; power heuristic.
+                    float lampPdf = dist2 / (cosLight * cell.count * 6.0f);
+                    float bouncePdfHere = cosSurface / float(M_PI);
+                    float weight = lampPdf * lampPdf / (lampPdf * lampPdf + bouncePdfHere * bouncePdfHere);
+                    lampLight = lampEmission() * (bouncePdfHere / lampPdf * weight);
+                }
+            }
+        }
+
+        // Indirect lighting: one cosine-weighted bounce. With that distribution the
+        // bounce carries the full incoming light, so above water no fixed ambient
+        // term is needed: the sky and other surfaces fill the shadows.
+        Vec3 bounceDir = randomCosineDirection(hitNormal);
+        float cosBounce = std::max(1e-4f, hitNormal.dot(bounceDir));
+        Ray scattered(shadeOrigin, bounceDir);
+        Vec3 indirectLight = trace(scattered, world, depth - 1, isUnderwater, false, nullptr,
+                                   g_settings.sampleLamps ? &shadeOrigin : nullptr, cosBounce / float(M_PI));
+
+        if (isUnderwater) {
+            // Light scattered and absorbed inside the water is not simulated, so
+            // underwater surfaces keep an artistic model: a dimmed bounce plus a
+            // blue ambient that fades with depth. It is what gives the water its color.
+            Vec3 waterAmbient = Vec3(0.05f, 0.15f, 0.22f) *
+                                (0.3f + 0.7f * std::exp(-std::max(0.0f, 11.0f - hitPos.y) * 0.05f));
+            indirectLight = indirectLight * 0.2f + waterAmbient;
+        }
+
         // Use the procedurally textured albedo in the final color calculation
-        color = color + albedo * (directLight + indirectLight + ambient);
+        color = color + albedo * (directLight + lampLight + indirectLight);
     }
-        
+
     // Underwater fog - tropical blue
     if (isUnderwater) {
         float distance = (hitPos - ray.origin).length();
@@ -2398,6 +2532,10 @@ int main(int argc, char* argv[]) {
             g_settings.enableCaustics = false;
         } else if (arg == "--no-volumetrics") {
             g_settings.enableVolumetrics = false;
+        } else if (arg == "--no-lamp-sampling") {
+            g_settings.sampleLamps = false;
+        } else if (arg == "--time" && i + 1 < argc) {
+            g_settings.timeOfDay = std::max(0.0f, std::min(1.0f, std::stof(argv[++i])));
         } else if (arg == "--resolution" && i + 1 < argc) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
@@ -2418,7 +2556,9 @@ int main(int argc, char* argv[]) {
                          "  --threads <n>        render threads (default: all)\n"
                          "  --seed <n>           world seed (default 42)\n"
                          "  --caustic-quality <1-3>  8, 16 or 32 caustic samples (default 3)\n"
-                         "  --no-caustics, --no-volumetrics   turn an effect off\n";
+                         "  --time <0-1>         time of day (default 0.85; 0.5 is midday)\n"
+                         "  --no-caustics, --no-volumetrics   turn an effect off\n"
+                         "  --no-lamp-sampling   find light blocks by bounces only (slower to converge; for comparison)\n";
             return 0;
         } else if (!arg.empty() && arg[0] != '-') {
             demoFile = arg;
