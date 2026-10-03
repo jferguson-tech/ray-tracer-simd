@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+# Build and render output
+build/
+third_party/
+output/
+pathtracer
+benchmark_results.json

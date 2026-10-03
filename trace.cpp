@@ -1,6 +1,11 @@
 // CPU Pathtracer with Demo Recording & Benchmarking
 // With Physically-Based Caustics
 
+// MSVC: M_PI from <cmath>, and no min/max macros from <windows.h>
+#define _USE_MATH_DEFINES
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include <iostream>
 #include <vector>
@@ -16,10 +21,16 @@
 #include <cstring>
 #include <queue>
 #include <set>
+#include <string>
+#include <tuple>
 #include <immintrin.h>
 #include <SDL2/SDL.h>
 #include <fstream>
 #include <memory>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // Platform-specific includes for system info
 #ifdef _WIN32
@@ -239,10 +250,11 @@ public:
         const auto& kf1 = keyframes[i];
         const auto& kf2 = keyframes[i + 1];
         
-        float t = (time - kf1.time) / (kf2.time - kf1.time);
-        
-        // Smooth interpolation using cubic ease
-        t = t * t * (3.0f - 2.0f * t);
+        // Linear between keyframes: they are recorded at 30 Hz, and easing each
+        // short segment would stop the camera at every keyframe (visible stutter).
+        float span = kf2.time - kf1.time;
+        float t = span > 1e-6f ? (time - kf1.time) / span : 0.0f;
+        t = std::max(0.0f, std::min(1.0f, t));
         
         x = kf1.x + (kf2.x - kf1.x) * t;
         y = kf1.y + (kf2.y - kf1.y) * t;
@@ -339,6 +351,12 @@ public:
                 
                 kfPos = content.find("}", kfPos);
             }
+        }
+        
+        // Older recordings stamped the first keyframe with a stale clock value
+        // (larger than the ones after it); it belongs at the start.
+        if (keyframes.size() >= 2 && keyframes[0].time > keyframes[1].time) {
+            keyframes[0].time = 0.0f;
         }
         
         std::cout << "Loaded demo path from " << filename << " (" << keyframes.size() << " keyframes)\n";
@@ -475,6 +493,7 @@ constexpr int MAX_BOUNCES = 5;
 constexpr int SAMPLES_PER_PIXEL = 2;
 constexpr float FOV = 90.0f;
 constexpr float MAX_RAY_DISTANCE = 500.0f;
+constexpr float WATER_ANIM_SPEED = 1.5f;   // water animation units per second
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1121,13 +1140,51 @@ public:
         }
     }
     
+    // Clip a ray to the world box. Returns false if it never enters. For an
+    // origin outside the world, `pos` moves to the entry point, `entryDist` is
+    // the distance to it and `entryNormal` the face it enters through.
+    static bool enterWorld(Vec3& pos, const Vec3& dir, float maxDist, float& entryDist, Vec3& entryNormal) {
+        entryDist = 0.0f;
+        const float lo[3] = {0.0f, 0.0f, 0.0f};
+        const float hi[3] = {float(WORLD_SIZE), float(WORLD_HEIGHT), float(WORLD_SIZE)};
+        const float o[3] = {pos.x, pos.y, pos.z};
+        const float d[3] = {dir.x, dir.y, dir.z};
+        if (o[0] >= lo[0] && o[0] < hi[0] && o[1] >= lo[1] && o[1] < hi[1] && o[2] >= lo[2] && o[2] < hi[2])
+            return true;
+        float tEnter = 0.0f, tExit = maxDist;
+        int axis = -1;
+        for (int a = 0; a < 3; a++) {
+            if (d[a] == 0.0f) {
+                if (o[a] < lo[a] || o[a] >= hi[a]) return false;
+                continue;
+            }
+            float t0 = (lo[a] - o[a]) / d[a];
+            float t1 = (hi[a] - o[a]) / d[a];
+            if (t0 > t1) std::swap(t0, t1);
+            if (t0 > tEnter) { tEnter = t0; axis = a; }
+            tExit = std::min(tExit, t1);
+        }
+        if (axis < 0 || tEnter >= tExit) return false;
+        entryDist = tEnter + 1e-3f;                 // just inside the face
+        pos = pos + dir * entryDist;
+        float n[3] = {0.0f, 0.0f, 0.0f};
+        n[axis] = d[axis] > 0 ? -1.0f : 1.0f;
+        entryNormal = Vec3(n[0], n[1], n[2]);
+        return true;
+    }
+
     bool raycast(const Ray& ray, float maxDist, Vec3& hitPos, Vec3& hitNormal, BlockType& hitBlock) const {
         Vec3 pos = ray.origin;
         Vec3 dir = ray.direction;
+        hitBlock = AIR;                             // defined even when nothing is hit
+        Vec3 normal(0, 1, 0);
+        float entryDist;
+        if (!enterWorld(pos, dir, maxDist, entryDist, normal)) return false;
+        maxDist -= entryDist;
         
-        int x = static_cast<int>(std::floor(pos.x));
-        int y = static_cast<int>(std::floor(pos.y));
-        int z = static_cast<int>(std::floor(pos.z));
+        int x = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.x))));
+        int y = std::min(WORLD_HEIGHT - 1, std::max(0, static_cast<int>(std::floor(pos.y))));
+        int z = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.z))));
         
         int stepX = dir.x > 0 ? 1 : -1;
         int stepY = dir.y > 0 ? 1 : -1;
@@ -1142,7 +1199,6 @@ public:
         float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
         
         float dist = 0;
-        Vec3 normal(0, 1, 0);
         
         BlockType startBlock = getBlock(static_cast<int>(std::floor(ray.origin.x)),
                                         static_cast<int>(std::floor(ray.origin.y)),
@@ -1209,6 +1265,49 @@ public:
             }
         }
 
+        return false;
+    }
+
+    // Sun shadow test: true if a solid block lies between `origin` and the sun.
+    // Water is transparent here, so blocks above a lake shade its bed and a
+    // ray that reaches open sky is never read as blocked.
+    bool sunOccluded(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        Vec3 pos = origin;
+        Vec3 normal;
+        float entryDist;
+        if (!enterWorld(pos, dir, maxDist, entryDist, normal)) return false;
+        maxDist -= entryDist;
+
+        int x = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.x))));
+        int y = std::min(WORLD_HEIGHT - 1, std::max(0, static_cast<int>(std::floor(pos.y))));
+        int z = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.z))));
+
+        int stepX = dir.x > 0 ? 1 : -1;
+        int stepY = dir.y > 0 ? 1 : -1;
+        int stepZ = dir.z > 0 ? 1 : -1;
+
+        float tMaxX = (dir.x != 0) ? ((x + (stepX > 0 ? 1 : 0)) - pos.x) / dir.x : 1e30f;
+        float tMaxY = (dir.y != 0) ? ((y + (stepY > 0 ? 1 : 0)) - pos.y) / dir.y : 1e30f;
+        float tMaxZ = (dir.z != 0) ? ((z + (stepZ > 0 ? 1 : 0)) - pos.z) / dir.z : 1e30f;
+
+        float tDeltaX = (dir.x != 0) ? stepX / dir.x : 1e30f;
+        float tDeltaY = (dir.y != 0) ? stepY / dir.y : 1e30f;
+        float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
+
+        float dist = 0;
+        while (dist < maxDist) {
+            BlockType block = static_cast<BlockType>(blocks[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT]);
+            if (block != AIR && block != WATER) return true;
+
+            if (tMaxX < tMaxY && tMaxX < tMaxZ) {
+                x += stepX; dist = tMaxX; tMaxX += tDeltaX;
+            } else if (tMaxY < tMaxZ) {
+                y += stepY; dist = tMaxY; tMaxY += tDeltaY;
+            } else {
+                z += stepZ; dist = tMaxZ; tMaxZ += tDeltaZ;
+            }
+            if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) break;
+        }
         return false;
     }
 
@@ -1661,7 +1760,8 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
 }
 
 // Path tracing (simplified for space, same as original)
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false);
+// hitDistOut (optional) receives the distance this ray travelled to its first hit.
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, float* hitDistOut = nullptr);
 
 // Renderer - modified to support offline rendering
 class Renderer {
@@ -1703,8 +1803,6 @@ public:
         if (cameraMoving) {
             reset();
         }
-        
-        g_settings.waterAnimation += 0.05f;
         
         nextTile = 0;
         sampleCount++;
@@ -1803,7 +1901,8 @@ public:
 };
 
 // Complete trace function implementation
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater) {
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, float* hitDistOut) {
+    if (hitDistOut) *hitDistOut = 0.0f;
     if (depth <= 0) return Vec3(0, 0, 0);
     
     SunLight sun;
@@ -1818,6 +1917,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater) {
     if (didHit) {
         hitDistance = (hitPos - ray.origin).length();
     }
+    if (hitDistOut) *hitDistOut = hitDistance;
     
     // Calculate volumetric lighting along the ray
     Vec3 volumetrics(0, 0, 0);
@@ -1873,14 +1973,14 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater) {
         Ray refractedRay(offsetPos, refractedDir);
         
         bool rayNowInsideWater = entering && !totalInternalReflection;
-        Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater);
+        float waterDistance = 0.0f;                 // how far the refracted ray travels in the water
+        Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, &waterDistance);
         
         // Water absorption with tropical blue tint
         if (entering && !totalInternalReflection) {
             // Tropical blue-teal water color
             Vec3 waterTint(0.05f, 0.25f, 0.35f);
-            float distance = (hitPos - ray.origin).length();
-            float absorption = std::exp(-distance * 0.08f);  // Stronger absorption for more color
+            float absorption = std::exp(-waterDistance * 0.08f);  // Stronger absorption for more color
             transmitted = transmitted * absorption + waterTint * (1.0f - absorption) * 0.4f;
         }
         
@@ -1959,14 +2059,10 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater) {
                 break;
         }
         
-        // Direct sun lighting
+        // Direct sun lighting (water does not block the sun; solid blocks do,
+        // including ones above the water when the surface is underwater)
         Vec3 toSun = sun.direction * -1;
-        Ray shadowRay(hitPos + hitNormal * 0.01f, toSun);
-        Vec3 shadowHit, shadowNormal;
-        BlockType shadowBlock;
-        
-        bool sunVisible = !world.raycast(shadowRay, 100.0f, shadowHit, shadowNormal, shadowBlock);
-        if (shadowBlock == WATER) sunVisible = true;
+        bool sunVisible = !world.sunOccluded(hitPos + hitNormal * 0.01f, toSun, 100.0f);
         
         float sunDot = std::max(0.0f, hitNormal.dot(toSun));
         float sunStrength = sunDot * sun.intensity;
@@ -2043,7 +2139,25 @@ int main(int argc, char* argv[]) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
         } else if (arg == "--caustic-quality" && i + 1 < argc) {
-            g_settings.causticQuality = std::stoi(argv[++i]);
+            g_settings.causticQuality = std::max(1, std::min(3, std::stoi(argv[++i])));
+        } else if (arg == "--play") {
+            g_settings.mode = Settings::MODE_PLAYBACK;
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: pathtracer [demo.json] [options]\n"
+                         "  demo.json            camera path to load (same as --demo)\n"
+                         "  --demo <file>        camera path file (default demo.json)\n"
+                         "  --play               play the camera path in the window\n"
+                         "  --benchmark          play the camera path and write benchmark_results.json\n"
+                         "  --offline            render the camera path to output/frame_NNNNN.ppm (no window)\n"
+                         "  --samples <n>        samples per pixel for each offline frame (default 1000)\n"
+                         "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
+                         "  --caustic-quality <1-3>  8, 16 or 32 caustic samples (default 3)\n";
+            return 0;
+        } else if (!arg.empty() && arg[0] != '-') {
+            demoFile = arg;
+        } else {
+            std::cerr << "Unknown or incomplete option: " << arg << " (see --help)\n";
+            return 1;
         }
     }
     
@@ -2311,6 +2425,8 @@ int main(int argc, char* argv[]) {
         }
         
         // Demo recording (time-based, not frame-based)
+        // Re-read the clock here: F1 resets startTime during event handling above.
+        totalElapsed = std::chrono::duration<float>(currentTime - startTime).count();
         if (g_settings.mode == Settings::MODE_RECORDING) {
             float recordInterval = 0.033f; // 30 Hz recording rate
             if (std::chrono::duration<float>(currentTime - lastRecordTime).count() >= recordInterval) {
@@ -2328,6 +2444,9 @@ int main(int argc, char* argv[]) {
             if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
                 // Fixed time step for offline rendering
                 demoTime = (offlineFrameCount / 30.0f); // 30 FPS output
+                // The water follows the frame's time, so it holds still while a
+                // frame accumulates and its speed does not depend on --samples.
+                g_settings.waterAnimation = demoTime * WATER_ANIM_SPEED;
             } else {
                 demoTime += deltaTime;
             }
@@ -2360,6 +2479,13 @@ int main(int argc, char* argv[]) {
         
         if (needsReset) {
             renderer.reset();
+        }
+        
+        // Water animates in real time while the view is changing. While the
+        // camera is still the image accumulates, so the water holds its pose
+        // (accumulating over moving waves would blur the caustics forever).
+        if (g_settings.mode != Settings::MODE_OFFLINE_RENDER && (cameraMoving || needsReset)) {
+            g_settings.waterAnimation += std::min(deltaTime, 0.1f) * WATER_ANIM_SPEED;
         }
         
         prevCamera = camera;
