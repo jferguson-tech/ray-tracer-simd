@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fast optimized video creator for PPM frames
+Fast optimized video creator for rendered frames (PNG, or PPM from older builds)
 Uses multiple optimization strategies for maximum speed
 Fixed with H.264 codec for browser compatibility (no ffmpeg needed)
 """
@@ -88,12 +88,31 @@ def ppm_to_bgr_fastest(ppm_file: str) -> tuple:
     
     return frame_num, np.ascontiguousarray(img_bgr)
 
-def process_frame_worker(ppm_file: str) -> tuple:
+def find_frames(input_dir: str) -> list:
+    """Frame files in order: PNG (current builds), else PPM (older builds)."""
+    for ext in ('png', 'ppm'):
+        files = sorted(glob.glob(os.path.join(input_dir, f'frame_*.{ext}')))
+        if files:
+            return files
+    return []
+
+def read_frame(frame_file: str) -> tuple:
+    """Read one frame as (frame number, BGR image)."""
+    if frame_file.lower().endswith('.ppm'):
+        return ppm_to_bgr_fastest(frame_file)
+    name = os.path.splitext(os.path.basename(frame_file))[0]
+    frame_num = int(name.replace('frame_', ''))
+    img_bgr = cv2.imread(frame_file, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError(f"Could not read {frame_file}")
+    return frame_num, img_bgr
+
+def process_frame_worker(frame_file: str) -> tuple:
     """Worker function for multiprocessing."""
     try:
-        return ppm_to_bgr_fastest(ppm_file)
+        return read_frame(frame_file)
     except Exception as e:
-        print(f"Error processing {ppm_file}: {e}")
+        print(f"Error processing {frame_file}: {e}")
         return None, None
 
 def create_video_fast(input_dir: str = 'output',
@@ -105,7 +124,7 @@ def create_video_fast(input_dir: str = 'output',
     Create video using fast parallel processing.
     
     Args:
-        input_dir: Directory with PPM frames
+        input_dir: Directory with frame_NNNNN.png (or .ppm) files
         output_file: Output video file
         fps: Frames per second
         num_workers: Number of workers (None = auto)
@@ -120,10 +139,10 @@ def create_video_fast(input_dir: str = 'output',
     print("-" * 60)
     
     # Find all frames
-    frame_files = sorted(glob.glob(os.path.join(input_dir, 'frame_*.ppm')))
-    
+    frame_files = find_frames(input_dir)
+
     if not frame_files:
-        print(f"Error: No PPM frames found in {input_dir}")
+        print(f"Error: No frames (frame_*.png or frame_*.ppm) found in {input_dir}")
         return False
     
     total_frames = len(frame_files)
@@ -131,7 +150,7 @@ def create_video_fast(input_dir: str = 'output',
     
     # Get dimensions from first frame
     print("Reading first frame...")
-    _, first_frame = ppm_to_bgr_fastest(frame_files[0])
+    _, first_frame = read_frame(frame_files[0])
     height, width = first_frame.shape[:2]
     print(f"Video dimensions: {width}x{height}")
     

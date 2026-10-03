@@ -26,6 +26,7 @@
 #include <immintrin.h>
 #include <SDL2/SDL.h>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 
 #ifndef M_PI
@@ -460,6 +461,7 @@ struct Settings {
     
     int offlineTargetSamples = 1000;  // For offline rendering
     std::string outputDir = "output";
+    int threads = 0;                  // 0 = one per hardware thread
     
     void adjustRenderResolution(int preset) {
         switch(preset) {
@@ -730,10 +732,35 @@ struct SunLight {
 };
 
 // Random utilities
-thread_local std::mt19937 rng(std::random_device{}());
-thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+// PCG32 (pcg-random.org, minimal variant). Each render thread re-seeds it for
+// every pixel of every pass from (frame, pass, pixel), so an image depends only
+// on its settings, never on how the threads happened to interleave.
+struct Pcg32 {
+    uint64_t state = 0x853c49e6748fea9bULL;
+    uint64_t inc = 0xda3e39cb94b95bdbULL;
 
-inline float random01() { return dist(rng); }
+    void seed(uint64_t initState, uint64_t sequence) {
+        state = 0;
+        inc = (sequence << 1) | 1;
+        next();
+        state += initState;
+        next();
+    }
+    uint32_t next() {
+        uint64_t old = state;
+        state = old * 6364136223846793005ULL + inc;
+        uint32_t xorshifted = static_cast<uint32_t>(((old >> 18) ^ old) >> 27);
+        uint32_t rot = static_cast<uint32_t>(old >> 59);
+        return (xorshifted >> rot) | (xorshifted << ((32 - rot) & 31));
+    }
+};
+thread_local Pcg32 rng;
+
+// Uniform in [0, 1)
+inline float random01() { return (rng.next() >> 8) * (1.0f / 16777216.0f); }
+
+// Rays traced by the current thread (grid marches, shadow tests, packet lanes)
+thread_local uint64_t t_rayCount = 0;
 
 inline Vec3 randomInHemisphere(const Vec3& normal) {
     Vec3 dir;
@@ -1177,6 +1204,7 @@ public:
         Vec3 pos = ray.origin;
         Vec3 dir = ray.direction;
         hitBlock = AIR;                             // defined even when nothing is hit
+        t_rayCount++;
         Vec3 normal(0, 1, 0);
         float entryDist;
         if (!enterWorld(pos, dir, maxDist, entryDist, normal)) return false;
@@ -1272,6 +1300,7 @@ public:
     // Water is transparent here, so blocks above a lake shade its bed and a
     // ray that reaches open sky is never read as blocked.
     bool sunOccluded(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        t_rayCount++;
         Vec3 pos = origin;
         Vec3 normal;
         float entryDist;
@@ -1366,6 +1395,7 @@ public:
             laneActive[0] ? -1 : 0, laneActive[1] ? -1 : 0, laneActive[2] ? -1 : 0, laneActive[3] ? -1 : 0,
             laneActive[4] ? -1 : 0, laneActive[5] ? -1 : 0, laneActive[6] ? -1 : 0, laneActive[7] ? -1 : 0);
         __m256i result = _mm256_setzero_si256();    // AIR = no hit
+        for (int i = 0; i < 8; i++) t_rayCount += laneActive[i] ? 1 : 0;
         __m256i inWater = _mm256_cmpeq_epi32(gatherBlocks(inBoundsMask()), waterV);
 
         for (int guard = 0; guard < 2048; guard++) {
@@ -1763,11 +1793,88 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
 // hitDistOut (optional) receives the distance this ray travelled to its first hit.
 Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, float* hitDistOut = nullptr);
 
+// Minimal PNG writer: 8-bit RGB, stored (uncompressed) deflate blocks.
+// No external library; any viewer or video tool reads the result.
+static uint32_t pngCrc(const uint8_t* data, size_t n, uint32_t crc) {
+    static uint32_t table[256];
+    static bool ready = false;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+        ready = true;
+    }
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+static bool writePNG(const std::string& filename, const uint8_t* rgb, int width, int height) {
+    // Scanlines: a filter byte (0 = none) then the row's RGB bytes
+    const size_t rowBytes = size_t(width) * 3 + 1;
+    std::vector<uint8_t> raw(rowBytes * height);
+    for (int y = 0; y < height; y++) {
+        raw[y * rowBytes] = 0;
+        std::memcpy(&raw[y * rowBytes + 1], rgb + size_t(y) * width * 3, size_t(width) * 3);
+    }
+    // zlib stream of stored blocks (at most 65535 bytes each) plus Adler-32
+    std::vector<uint8_t> z;
+    z.reserve(raw.size() + raw.size() / 65535 * 5 + 16);
+    z.push_back(0x78);
+    z.push_back(0x01);
+    uint32_t a = 1, b = 0;
+    for (size_t pos = 0; pos < raw.size();) {
+        size_t n = std::min<size_t>(65535, raw.size() - pos);
+        z.push_back(pos + n == raw.size() ? 1 : 0);
+        z.push_back(uint8_t(n & 0xFF));
+        z.push_back(uint8_t(n >> 8));
+        z.push_back(uint8_t(~n & 0xFF));
+        z.push_back(uint8_t((~n >> 8) & 0xFF));
+        for (size_t i = 0; i < n; i++) {
+            a = (a + raw[pos + i]) % 65521;
+            b = (b + a) % 65521;
+        }
+        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + n);
+        pos += n;
+    }
+    uint32_t adler = (b << 16) | a;
+    for (int s = 24; s >= 0; s -= 8) z.push_back(uint8_t(adler >> s));
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file) return false;
+    auto put32 = [&](uint32_t v) {
+        const uint8_t bytes[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+        file.write(reinterpret_cast<const char*>(bytes), 4);
+    };
+    auto chunk = [&](const char* type, const uint8_t* data, size_t n) {
+        put32(uint32_t(n));
+        file.write(type, 4);
+        if (n) file.write(reinterpret_cast<const char*>(data), n);
+        uint32_t crc = pngCrc(reinterpret_cast<const uint8_t*>(type), 4, 0);
+        if (n) crc = pngCrc(data, n, crc);
+        put32(crc);
+    };
+    const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    file.write(reinterpret_cast<const char*>(signature), 8);
+    const uint8_t header[13] = {
+        uint8_t(width >> 24), uint8_t(width >> 16), uint8_t(width >> 8), uint8_t(width),
+        uint8_t(height >> 24), uint8_t(height >> 16), uint8_t(height >> 8), uint8_t(height),
+        8, 2, 0, 0, 0};                           // 8 bits per channel, RGB
+    chunk("IHDR", header, 13);
+    chunk("IDAT", z.data(), z.size());
+    chunk("IEND", nullptr, 0);
+    return bool(file);
+}
+
 // Renderer - modified to support offline rendering
 class Renderer {
     std::vector<uint32_t> framebuffer;
     std::vector<Vec3> accumulator;
     std::atomic<int> nextTile;
+    std::atomic<uint64_t> rayCount{0};
+    uint64_t frameSeed = 0;
     int sampleCount;
     int currentWidth, currentHeight;
     static constexpr int TILE_SIZE = 8;
@@ -1806,8 +1913,9 @@ public:
         
         nextTile = 0;
         sampleCount++;
-        
-        int numThreads = std::thread::hardware_concurrency();
+
+        int numThreads = g_settings.threads > 0 ? g_settings.threads
+                                                : std::max(1u, std::thread::hardware_concurrency());
         std::vector<std::thread> threads;
         
         bool cameraUnderwater = getCameraUnderwater(camera, world);
@@ -1842,8 +1950,16 @@ public:
         }
     }
     
+    // Selects the random sequence for the following passes. With the same seed,
+    // settings and pass count, a render is identical from run to run.
+    void setFrameSeed(uint64_t seed) { frameSeed = seed; }
+    uint64_t getRayCount() const { return rayCount.load(); }
+    void resetRayCount() { rayCount = 0; }
+
     void renderThread(const Camera& camera, const World& world, bool cameraUnderwater) {
         float aspectRatio = float(currentWidth) / currentHeight;
+        const uint64_t passSeed = frameSeed * 0x9E3779B97F4A7C15ULL + uint64_t(sampleCount);
+        t_rayCount = 0;
         int tilesX = (currentWidth + TILE_SIZE - 1) / TILE_SIZE;
         int tilesY = (currentHeight + TILE_SIZE - 1) / TILE_SIZE;
         int totalTiles = tilesX * tilesY;
@@ -1862,7 +1978,8 @@ public:
             for (int y = startY; y < endY; y++) {
                 for (int x = startX; x < endX; x++) {
                     Vec3 color(0, 0, 0);
-                    
+                    rng.seed(passSeed, uint64_t(y) * currentWidth + x);
+
                     for (int s = 0; s < SAMPLES_PER_PIXEL; s++) {
                         float u = (x + random01() - currentWidth/2.0f) / (currentWidth/2.0f);
                         float v = -(y + random01() - currentHeight/2.0f) / (currentHeight/2.0f);
@@ -1876,6 +1993,7 @@ public:
                 }
             }
         }
+        rayCount += t_rayCount;
     }
     
     const uint32_t* getFramebuffer() const { return framebuffer.data(); }
@@ -1883,20 +2001,15 @@ public:
     int getWidth() const { return currentWidth; }
     int getHeight() const { return currentHeight; }
     
-    void saveFrame(const std::string& filename) {
-        // Save as PPM for simplicity
-        std::ofstream file(filename);
-        file << "P3\n" << currentWidth << " " << currentHeight << "\n255\n";
-        
+    bool saveFrame(const std::string& filename) {
+        std::vector<uint8_t> rgb(size_t(currentWidth) * currentHeight * 3);
         for (int i = 0; i < currentWidth * currentHeight; i++) {
             uint32_t pixel = framebuffer[i];
-            int r = (pixel >> 16) & 0xFF;
-            int g = (pixel >> 8) & 0xFF;
-            int b = pixel & 0xFF;
-            file << r << " " << g << " " << b << "\n";
+            rgb[i * 3 + 0] = (pixel >> 16) & 0xFF;
+            rgb[i * 3 + 1] = (pixel >> 8) & 0xFF;
+            rgb[i * 3 + 2] = pixel & 0xFF;
         }
-        
-        file.close();
+        return writePNG(filename, rgb.data(), currentWidth, currentHeight);
     }
 };
 
@@ -2116,11 +2229,103 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
     return color + volumetrics;
 }
 
+// Fixed benchmark: the same views, sample count and random sequences on every
+// machine, so times and images compare across builds and computers. (The
+// --benchmark mode plays a camera path in real time, so what it renders depends
+// on how fast the machine is.)
+struct BenchView {
+    const char* name;
+    float x, y, z, yaw, pitch;
+};
+static const BenchView g_benchViews[] = {
+    {"lake",       92.5f, 15.3f, 98.2f, 4.19f, -0.20f},
+    {"shore",      49.6f, 14.1f, 65.3f, 1.93f, -0.01f},
+    {"underwater", 74.5f,  8.5f, 90.5f, 0.80f,  0.15f},
+    {"lakebed",    74.5f, 17.0f, 90.5f, 0.80f, -0.90f},
+    {"aerial",     64.0f, 75.0f, 64.0f, 0.60f, -1.20f},
+};
+
+int runFixedBenchmark(const World& world, int samples) {
+    Renderer renderer;
+    Camera camera;
+    SystemInfo sys = SystemInfo::get();
+    int threads = g_settings.threads > 0 ? g_settings.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+    std::filesystem::create_directories(g_settings.outputDir);
+
+    std::cout << "Fixed benchmark: " << g_settings.renderWidth << "x" << g_settings.renderHeight
+              << ", " << samples << " samples/pixel, " << threads << " threads\n";
+    std::cout << "CPU: " << sys.cpuModel << "\n\n";
+    std::cout << std::left << std::setw(12) << "View" << std::right << std::setw(10) << "Time (s)"
+              << std::setw(12) << "Mrays/s" << std::setw(14) << "Msamples/s" << "\n";
+
+    JSONWriter json;
+    json.startObject();
+    json.startObject("system_info");
+    sys.toJSON(json);
+    json.endObject();
+    json.addNumber("render_width", g_settings.renderWidth);
+    json.addNumber("render_height", g_settings.renderHeight);
+    json.addNumber("samples_per_pixel", samples);
+    json.addNumber("threads", threads);
+    json.addBool("caustics", g_settings.enableCaustics);
+    json.addBool("volumetrics", g_settings.enableVolumetrics);
+    json.startArray("views");
+
+    double totalTime = 0;
+    uint64_t totalRays = 0;
+    int viewIndex = 0;
+    for (const BenchView& v : g_benchViews) {
+        camera.setFromKeyframe(v.x, v.y, v.z, v.yaw, v.pitch);
+        g_settings.waterAnimation = 2.0f;
+        renderer.reset();
+        renderer.resetRayCount();
+        renderer.setFrameSeed(uint64_t(viewIndex++));
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        while (renderer.getSampleCount() < samples) renderer.render(camera, world, false);
+        double seconds = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+
+        uint64_t rays = renderer.getRayCount();
+        double pixelSamples = double(g_settings.renderWidth) * g_settings.renderHeight * renderer.getSampleCount();
+        std::string image = g_settings.outputDir + "/bench_" + v.name + ".png";
+        renderer.saveFrame(image);
+        std::cout << std::left << std::setw(12) << v.name << std::right << std::fixed
+                  << std::setw(10) << std::setprecision(2) << seconds
+                  << std::setw(12) << std::setprecision(1) << rays / seconds / 1e6
+                  << std::setw(14) << std::setprecision(2) << pixelSamples / seconds / 1e6 << "\n";
+
+        json.startObject();
+        json.addString("name", v.name);
+        json.addNumber("seconds", seconds);
+        json.addNumber("rays", double(rays));
+        json.addNumber("mrays_per_second", rays / seconds / 1e6);
+        json.addNumber("msamples_per_second", pixelSamples / seconds / 1e6);
+        json.addString("image", image);
+        json.endObject();
+        totalTime += seconds;
+        totalRays += rays;
+    }
+    json.endArray();
+    json.addNumber("total_seconds", totalTime);
+    json.addNumber("total_mrays_per_second", totalRays / totalTime / 1e6);
+    json.endObject();
+
+    std::cout << std::left << std::setw(12) << "total" << std::right << std::fixed
+              << std::setw(10) << std::setprecision(2) << totalTime
+              << std::setw(12) << std::setprecision(1) << totalRays / totalTime / 1e6 << "\n";
+    std::ofstream file("benchmark_fixed.json");
+    file << json.toString();
+    std::cout << "\nImages: " << g_settings.outputDir << "/bench_<view>.png   Results: benchmark_fixed.json\n";
+    return 0;
+}
+
 // Main function with demo recording
 int main(int argc, char* argv[]) {
     // Parse command line arguments
     bool offlineMode = false;
     bool benchmarkMode = false;
+    bool fixedBenchmark = false;
+    bool samplesGiven = false;
     std::string demoFile = "demo.json";
     
     for (int i = 1; i < argc; i++) {
@@ -2133,8 +2338,19 @@ int main(int argc, char* argv[]) {
             g_settings.mode = Settings::MODE_BENCHMARK;
         } else if (arg == "--demo" && i + 1 < argc) {
             demoFile = argv[++i];
+        } else if (arg == "--bench") {
+            fixedBenchmark = true;
         } else if (arg == "--samples" && i + 1 < argc) {
-            g_settings.offlineTargetSamples = std::stoi(argv[++i]);
+            g_settings.offlineTargetSamples = std::max(1, std::stoi(argv[++i]));
+            samplesGiven = true;
+        } else if (arg == "--threads" && i + 1 < argc) {
+            g_settings.threads = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--seed" && i + 1 < argc) {
+            g_settings.worldSeed = std::stoi(argv[++i]);
+        } else if (arg == "--no-caustics") {
+            g_settings.enableCaustics = false;
+        } else if (arg == "--no-volumetrics") {
+            g_settings.enableVolumetrics = false;
         } else if (arg == "--resolution" && i + 1 < argc) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
@@ -2148,10 +2364,14 @@ int main(int argc, char* argv[]) {
                          "  --demo <file>        camera path file (default demo.json)\n"
                          "  --play               play the camera path in the window\n"
                          "  --benchmark          play the camera path and write benchmark_results.json\n"
-                         "  --offline            render the camera path to output/frame_NNNNN.ppm (no window)\n"
-                         "  --samples <n>        samples per pixel for each offline frame (default 1000)\n"
+                         "  --bench              render fixed views, print timings, write benchmark_fixed.json (no window)\n"
+                         "  --offline            render the camera path to output/frame_NNNNN.png (no window)\n"
+                         "  --samples <n>        samples per pixel: offline frames (default 1000), --bench (default 32)\n"
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
-                         "  --caustic-quality <1-3>  8, 16 or 32 caustic samples (default 3)\n";
+                         "  --threads <n>        render threads (default: all)\n"
+                         "  --seed <n>           world seed (default 42)\n"
+                         "  --caustic-quality <1-3>  8, 16 or 32 caustic samples (default 3)\n"
+                         "  --no-caustics, --no-volumetrics   turn an effect off\n";
             return 0;
         } else if (!arg.empty() && arg[0] != '-') {
             demoFile = arg;
@@ -2161,7 +2381,14 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+    if (fixedBenchmark) {
+        World benchWorld;
+        benchWorld.generate(g_settings.worldSeed);
+        return runFixedBenchmark(benchWorld, samplesGiven ? g_settings.offlineTargetSamples : 32);
+    }
+
+    // Offline rendering needs no window, so it also runs on machines without a display.
+    if (!offlineMode && SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "SDL init failed: " << SDL_GetError() << std::endl;
         return 1;
     }
@@ -2199,7 +2426,7 @@ int main(int argc, char* argv[]) {
     BenchmarkRecorder benchmarkRecorder;
     
     bool running = true;
-    const Uint8* keystate = SDL_GetKeyboardState(nullptr);
+    const Uint8* keystate = offlineMode ? nullptr : SDL_GetKeyboardState(nullptr);
     
     auto startTime = std::chrono::high_resolution_clock::now();
     auto lastTime = startTime;
@@ -2247,14 +2474,11 @@ int main(int argc, char* argv[]) {
     
     // Create output directory for offline rendering
     if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
-#ifdef _WIN32
-        system(("mkdir " + g_settings.outputDir).c_str());
-#else
-        system(("mkdir -p " + g_settings.outputDir).c_str());
-#endif
+        std::filesystem::create_directories(g_settings.outputDir);
     }
-    
+
     int offlineFrameCount = 0;
+    uint64_t renderedFrames = 0;
     
     while (running) {
         auto currentTime = std::chrono::high_resolution_clock::now();
@@ -2490,7 +2714,10 @@ int main(int argc, char* argv[]) {
         
         prevCamera = camera;
         
-        // Render
+        // Render. Offline frames are seeded by their frame number, so re-rendering
+        // a frame reproduces it exactly; the live view just needs fresh noise.
+        renderer.setFrameSeed(g_settings.mode == Settings::MODE_OFFLINE_RENDER ? uint64_t(offlineFrameCount)
+                                                                              : renderedFrames++);
         auto renderStart = std::chrono::high_resolution_clock::now();
         renderer.render(camera, world, cameraMoving || needsReset);
         auto renderEnd = std::chrono::high_resolution_clock::now();
@@ -2501,8 +2728,11 @@ int main(int argc, char* argv[]) {
             if (renderer.getSampleCount() >= g_settings.offlineTargetSamples) {
                 std::stringstream ss;
                 ss << g_settings.outputDir << "/frame_" << std::setfill('0') 
-                   << std::setw(5) << offlineFrameCount << ".ppm";
-                renderer.saveFrame(ss.str());
+                   << std::setw(5) << offlineFrameCount << ".png";
+                if (!renderer.saveFrame(ss.str())) {
+                    std::cerr << "Could not write " << ss.str() << "\n";
+                    return 1;
+                }
                 std::cout << "Saved frame " << offlineFrameCount << " (samples: " 
                          << renderer.getSampleCount() << ")\n";
                 offlineFrameCount++;
