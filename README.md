@@ -4,7 +4,11 @@
 
 High-performance C++ path tracer with SIMD acceleration.
 
-![Path Tracer Demo](pathtracer.gif)
+![A dive through the lake: the camera descends from above the water past coral, kelp and glowing sea lanterns under a network of caustic light, looks up at the sun through the surface, and climbs back out](pathtracer.gif)
+
+*The scripted dive `demo_underwater.json`, rendered offline at 640x360 with 96
+samples per pixel. The GIF is reduced to 400 px and 10 fps;
+[pathtracer.mp4](pathtracer.mp4) is the full-quality video.*
 
 ## Features
 - AVX2 SIMD acceleration: measured 1.9-2.2x whole-frame speedup (3-5x in the vectorized subsystems)
