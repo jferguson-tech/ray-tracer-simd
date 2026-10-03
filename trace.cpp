@@ -449,7 +449,10 @@ struct Settings {
     bool enableCaustics = true;
     bool enableVolumetrics = true;
     bool sampleLamps = true;          // sample light blocks directly (off: found by bounces only)
-    int causticQuality = 3;  // 1=low (8 samples), 2=medium (16 samples), 3=high (32 samples)
+    bool enableParticles = true;      // drifting specks in the water
+    float causticStrength = 1.0f;     // contrast of the caustic pattern (0 = even light)
+    float shaftStrength = 1.0f;       // brightness of underwater light shafts
+    int causticQuality = 2;  // caustic map detail: 1=low (2 texels per block), 2=medium (4), 3=high (8)
     
     // New settings for recording/playback
     enum Mode {
@@ -497,6 +500,8 @@ constexpr int SAMPLES_PER_PIXEL = 2;
 constexpr float FOV = 90.0f;
 constexpr float MAX_RAY_DISTANCE = 500.0f;
 constexpr float WATER_ANIM_SPEED = 1.5f;   // water animation units per second
+constexpr int WATER_LEVEL = 11;            // water fills the blocks below this height; its surface is at y = WATER_LEVEL
+constexpr float WATER_IOR = 1.333f;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -672,7 +677,12 @@ enum BlockType : uint8_t {
     LEAVES,
     LIGHT,
     WATER,
-    SAND
+    SAND,
+    CORAL_PINK,
+    CORAL_ORANGE,
+    CORAL_PURPLE,
+    KELP,
+    SEA_LANTERN
 };
 
 // Static material properties
@@ -695,14 +705,27 @@ static const MaterialProps g_materials[] = {
     {{0.3f, 0.7f, 0.3f}, {0, 0, 0}, 0.8f, 1.0f, 0.0f, false},  // LEAVES
     {{1, 1, 1}, {10, 10, 8}, 0.1f, 1.0f, 0.0f, false},         // LIGHT
     {{0.1f, 0.35f, 0.45f}, {0, 0, 0}, 0.02f, 1.333f, 0.65f, true}, // WATER
-    {{0.76f, 0.7f, 0.5f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}  // SAND
+    {{0.76f, 0.7f, 0.5f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}, // SAND
+    {{0.90f, 0.36f, 0.48f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}, // CORAL_PINK
+    {{0.95f, 0.52f, 0.18f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}, // CORAL_ORANGE
+    {{0.58f, 0.32f, 0.80f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}, // CORAL_PURPLE
+    {{0.20f, 0.46f, 0.16f}, {0, 0, 0}, 0.9f, 1.0f, 0.0f, false}, // KELP
+    {{1, 1, 1}, {2.5f, 8.0f, 9.0f}, 0.1f, 1.0f, 0.0f, false}     // SEA_LANTERN
 };
+
+// Does this block give off light?
+inline bool isEmitter(BlockType block) {
+    const Vec3& e = g_materials[block].emission;
+    return e.x > 0 || e.y > 0 || e.z > 0;
+}
 
 // Sun light system
 struct SunLight {
     Vec3 direction;
     Vec3 color;
     float intensity;
+    Vec3 refracted;       // direction of sunlight under flat water (unit, pointing down)
+    float beamGain;       // strength of that beam relative to the sun in air
     
     void updateFromTimeOfDay(float timeOfDay) {
         float sunAngle = timeOfDay * M_PI;
@@ -725,12 +748,25 @@ struct SunLight {
             color = Vec3(1.0f, 0.95f, 0.8f) * (1 - t) + Vec3(1.0f, 0.5f, 0.3f) * t;
             intensity = 0.8f * (1 - t) + 0.2f * t;
         }
+
+        // Under flat water: Snell refraction, Fresnel transmission. A horizontal
+        // surface just under the water receives cosI * transmission of the
+        // sun's light; beamGain turns that into the strength of the beam itself.
+        float cosI = std::max(0.0f, -direction.y);
+        float ratio = 1.0f / WATER_IOR;
+        float cosT = std::sqrt(std::max(0.0f, 1.0f - ratio * ratio * (1.0f - cosI * cosI)));
+        refracted = (direction * ratio + Vec3(0, 1, 0) * (ratio * cosI - cosT)).normalize();
+        float fresnel = 0.02f + 0.98f * std::pow(1.0f - cosI, 5.0f);
+        beamGain = cosI * (1.0f - fresnel) / std::max(0.05f, -refracted.y);
     }
     
     Vec3 getLightContribution() const {
         return color * intensity;
     }
 };
+
+// The sun for the frame being rendered (set once per pass by the renderer)
+SunLight g_sun;
 
 // Random utilities
 // PCG32 (pcg-random.org, minimal variant). Each render thread re-seeds it for
@@ -762,6 +798,18 @@ inline float random01() { return (rng.next() >> 8) * (1.0f / 16777216.0f); }
 
 // Rays traced by the current thread (grid marches, shadow tests, packet lanes)
 thread_local uint64_t t_rayCount = 0;
+
+// Integer hashes for things that must be the same on every run and platform
+inline uint32_t hash32(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+inline uint32_t hashCell(int x, int y, int z, uint32_t salt) {
+    return hash32(uint32_t(x) * 0x8da6b343U ^ uint32_t(y) * 0xd8163841U ^ uint32_t(z) * 0xcb1ab31fU ^ salt);
+}
+inline float hashFloat(uint32_t h) { return (h >> 8) * (1.0f / 16777216.0f); }
 
 // Uniform direction on the unit sphere
 inline Vec3 randomUnitVector() {
@@ -1014,12 +1062,30 @@ inline Vec3 getStoneTexture(const Vec3& pos, const Vec3& normal) {
     return stoneColor * roughness;
 }
 
+// Procedural coral texture: bumpy, with darker pores
+inline Vec3 getCoralTexture(const Vec3& pos, const Vec3& base) {
+    float bumps = noise3D(pos.x * 5.0f, pos.y * 5.0f, pos.z * 5.0f);
+    float pores = noise3D(pos.x * 13.0f + 7.0f, pos.y * 13.0f, pos.z * 13.0f);
+    Vec3 color = base * (0.7f + 0.5f * bumps);
+    if (pores > 0.72f) color = color * 0.55f;
+    return color;
+}
+
+// Procedural kelp texture: vertical blades with lighter and darker fronds
+inline Vec3 getKelpTexture(const Vec3& pos, const Vec3& base) {
+    float sway = std::sin(pos.y * 3.0f) * 1.5f;
+    float blades = 0.5f + 0.5f * std::sin(pos.x * 14.0f + sway) * std::cos(pos.z * 14.0f + sway);
+    float fronds = noise3D(pos.x * 4.0f, pos.y * 2.0f, pos.z * 4.0f);
+    return base * (0.55f + 0.45f * blades + 0.3f * fronds);
+}
+
 // Voxel World
 class World {
     std::vector<uint8_t> blocks;
     int seed;
     int topY = WORLD_HEIGHT - 1;      // highest y that holds any block
-    std::vector<Vec3i> lights;        // every LIGHT block
+    std::vector<Vec3i> lights;        // every block that gives off light
+    uint64_t generation = 0;          // changes whenever the world is regenerated
     
     float getTerrainHeight(int x, int z) const {
         float height = 12;
@@ -1102,6 +1168,52 @@ class World {
         }
     }
     
+    // Smooth 2D noise in [0, 1] from the integer hash: where kelp and coral grow in patches
+    static float patchNoise(float x, float z, uint32_t salt) {
+        int ix = static_cast<int>(std::floor(x)), iz = static_cast<int>(std::floor(z));
+        float tx = x - ix, tz = z - iz;
+        tx = tx * tx * (3.0f - 2.0f * tx);
+        tz = tz * tz * (3.0f - 2.0f * tz);
+        float a = hashFloat(hashCell(ix, 0, iz, salt)), b = hashFloat(hashCell(ix + 1, 0, iz, salt));
+        float c = hashFloat(hashCell(ix, 0, iz + 1, salt)), d = hashFloat(hashCell(ix + 1, 0, iz + 1, salt));
+        return (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz;
+    }
+
+    // Rocks, coral, kelp and sea lanterns on the lake beds. Placement comes from
+    // an integer hash of the column, so it is the same on every platform, and
+    // it only ever replaces water: the land and the shorelines are unchanged.
+    void decorateLakes() {
+        const uint32_t salt = 0x9e3779b9U + uint32_t(seed) * 7919U;
+        for (int z = 0; z < WORLD_SIZE; z++) {
+            for (int x = 0; x < WORLD_SIZE; x++) {
+                if (getBlock(x, WATER_LEVEL - 1, z) != WATER) continue;
+                int bed = WATER_LEVEL - 1;                       // highest block of the bed
+                while (bed >= 0 && getBlock(x, bed, z) == WATER) bed--;
+                int depth = WATER_LEVEL - 1 - bed;               // blocks of water above the bed
+                if (bed < 0 || depth < 2) continue;
+
+                uint32_t h = hashCell(x, 0, z, salt);
+                float r = hashFloat(h), r2 = hashFloat(hash32(h + 1)), r3 = hashFloat(hash32(h + 2));
+                float kelpPatch = patchNoise(x * 0.11f, z * 0.11f, salt + 11);
+                float coralPatch = patchNoise(x * 0.16f + 40.0f, z * 0.16f, salt + 23);
+
+                if (depth >= 4 && r < 0.006f) {
+                    setBlock(x, bed + 1, z, SEA_LANTERN);
+                } else if (r < 0.035f) {
+                    int height = std::min(depth - 1, 1 + (r2 > 0.6f ? 1 : 0));
+                    for (int k = 0; k < height; k++) setBlock(x, bed + 1 + k, z, STONE);
+                } else if (depth >= 3 && kelpPatch > 0.58f && r2 < 0.40f) {
+                    int height = std::min(depth - 2, 1 + static_cast<int>(r3 * 5.0f));
+                    for (int k = 0; k < height; k++) setBlock(x, bed + 1 + k, z, KELP);
+                } else if (coralPatch > 0.60f && r2 < 0.45f) {
+                    BlockType coral = r3 < 0.34f ? CORAL_PINK : r3 < 0.67f ? CORAL_ORANGE : CORAL_PURPLE;
+                    int height = std::min(depth - 1, 1 + (hashFloat(hash32(h + 3)) > 0.7f ? 1 : 0));
+                    for (int k = 0; k < height; k++) setBlock(x, bed + 1 + k, z, coral);
+                }
+            }
+        }
+    }
+
 public:
     // +8 tail bytes so 4-byte SIMD gathers at the last block index stay in-bounds
     World() : blocks(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE + 8, AIR), seed(42) {}
@@ -1159,7 +1271,8 @@ public:
             }
         }
         
-        generateWaterBodies(11);
+        generateWaterBodies(WATER_LEVEL);
+        decorateLakes();
 
         topY = 0;
         for (int z = 0; z < WORLD_SIZE; z++)
@@ -1167,6 +1280,16 @@ public:
                 for (int x = 0; x < WORLD_SIZE; x++)
                     if (getBlock(x, y, z) != AIR) topY = std::max(topY, y);
         buildLightCells();
+        generation++;
+    }
+
+    uint64_t getGeneration() const { return generation; }
+
+    // Is the water surface open above this column? (Outside the world counts
+    // as open water, so light also arrives from beyond the edge.)
+    bool waterSurfaceAt(int x, int z) const {
+        if (x < 0 || x >= WORLD_SIZE || z < 0 || z >= WORLD_SIZE) return true;
+        return blocks[x + (WATER_LEVEL - 1) * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT] == WATER;
     }
     
     // Light blocks near a point, for sampling their light directly. Each
@@ -1197,7 +1320,7 @@ public:
         for (int z = 0; z < WORLD_SIZE; z++)
             for (int y = 0; y < WORLD_HEIGHT; y++)
                 for (int x = 0; x < WORLD_SIZE; x++)
-                    if (getBlock(x, y, z) == LIGHT) lights.emplace_back(x, y, z);
+                    if (isEmitter(getBlock(x, y, z))) lights.emplace_back(x, y, z);
 
         lightCells.assign(CELLS_X * CELLS_Y * CELLS_Z, LightCell());
         std::vector<std::pair<float, int>> closest;
@@ -1567,67 +1690,54 @@ public:
     }
 };
 
-// Enhanced water surface normal for better caustics.
-// The 7 distinct wave angles are evaluated with one 8-wide sincos instead of
-// 13 scalar sin/cos calls; the height field itself cancels out of the normal.
-inline Vec3 getWaterNormal(const Vec3& pos, float time) {
-    alignas(32) float ang[8] = {
-        pos.x * 2.0f + time * 1.2f,
-        pos.z * 1.8f - time * 0.9f,
-        pos.x * 3.5f - time * 1.5f,
-        pos.z * 3.2f + time * 1.1f,
-        (pos.x + pos.z) * 1.2f + time * 0.7f,
-        pos.x * 5.0f + time * 2.0f,
-        pos.z * 4.5f - time * 1.8f,
-        0.0f
-    };
-    F8 s8, c8;
-    sincos8(F8::load(ang), s8, c8);
-    alignas(32) float sv[8], cv[8];
-    s8.store(sv);
-    c8.store(cv);
+// The water surface is a sum of eight waves travelling in different
+// directions, from 5-block swells to half-block ripples. Each is
+// height = a * sin(kx * x + kz * z + speed * t); only its slope is needed:
+// (slopeX, slopeZ) * cos(...). Long waves are gentle, so sunlight keeps
+// focusing well below the surface. Directions that are not multiples of each
+// other keep the caustics an irregular network, not a grid.
+struct WaterWave {
+    float kx, kz, speed, slopeX, slopeZ;
+};
+static const WaterWave g_waterWaves[8] = {
+    {  1.1140f,   0.4055f,  1.307f,   0.0940f,   0.0342f},   //   20 deg, wavelength 5.3, slope 0.100
+    {  1.3197f,  -0.9241f,  1.523f,   0.0901f,  -0.0631f},   //  -35 deg, wavelength 3.9, slope 0.110
+    {  0.5246f,   1.9578f,  1.708f,   0.0259f,   0.0966f},   //   75 deg, wavelength 3.1, slope 0.100
+    { -1.7560f,   2.0927f,  1.983f,  -0.0579f,   0.0689f},   //  130 deg, wavelength 2.3, slope 0.090
+    {  0.6418f,  -3.6398f,  2.307f,   0.0139f,  -0.0788f},   //  -80 deg, wavelength 1.7, slope 0.080
+    { -4.6685f,   1.2509f,  2.638f,  -0.0676f,   0.0181f},   //  165 deg, wavelength 1.3, slope 0.070
+    {  4.4875f,   5.3480f,  3.171f,   0.0321f,   0.0383f},   //   50 deg, wavelength 0.9, slope 0.050
+    { -5.2360f,  -9.0690f,  3.883f,  -0.0175f,  -0.0303f},   // -120 deg, wavelength 0.6, slope 0.035
+};
 
-    float dx = 0.12f * (
-        2.0f * cv[0] * cv[1] +
-        3.5f * cv[2] * cv[3] * 0.5f +
-        1.2f * cv[4] * 0.3f +
-        5.0f * cv[5] * cv[6] * 0.25f
-    );
-    float dz = 0.12f * (
-        -1.8f * sv[0] * sv[1] +
-        3.2f * sv[2] * sv[3] * 0.5f +
-        1.2f * cv[4] * 0.3f -
-        4.5f * sv[5] * sv[6] * 0.25f
-    );
-
-    return Vec3(-dx, 1.0f, -dz).normalize();
+// Water surface slope (dh/dx, dh/dz) at 8 points at once. The same function
+// shades the surface and drives the caustic map, so the two always agree.
+inline void waterSlope8(F8 px, F8 pz, float time, F8& dx, F8& dz) {
+    dx = F8(0.0f);
+    dz = F8(0.0f);
+    for (const WaterWave& w : g_waterWaves) {
+        F8 s, c;
+        sincos8(px * F8(w.kx) + pz * F8(w.kz) + F8(time * w.speed), s, c);
+        dx = dx + F8(w.slopeX) * c;
+        dz = dz + F8(w.slopeZ) * c;
+    }
 }
 
-// SoA variant: water surface normals at 8 (px, 11, pz) points at once,
-// used by the vectorized caustics sampling loop
+// Water surface normals (pointing up) at 8 points
 inline void waterNormal8(F8 px, F8 pz, float time, F8& nx, F8& ny, F8& nz) {
-    F8 sa1, ca1, sb1, cb1, sa2, ca2, sb2, cb2, sc, cc, sa3, ca3, sb3, cb3;
-    sincos8(px * F8(2.0f) + F8(time * 1.2f), sa1, ca1);
-    sincos8(pz * F8(1.8f) - F8(time * 0.9f), sb1, cb1);
-    sincos8(px * F8(3.5f) - F8(time * 1.5f), sa2, ca2);
-    sincos8(pz * F8(3.2f) + F8(time * 1.1f), sb2, cb2);
-    sincos8((px + pz) * F8(1.2f) + F8(time * 0.7f), sc, cc);
-    sincos8(px * F8(5.0f) + F8(time * 2.0f), sa3, ca3);
-    sincos8(pz * F8(4.5f) - F8(time * 1.8f), sb3, cb3);
-
-    F8 dx = F8(0.12f) * (F8(2.0f) * ca1 * cb1 +
-                         F8(3.5f * 0.5f) * ca2 * cb2 +
-                         F8(1.2f * 0.3f) * cc +
-                         F8(5.0f * 0.25f) * ca3 * cb3);
-    F8 dz = F8(0.12f) * (F8(-1.8f) * sa1 * sb1 +
-                         F8(3.2f * 0.5f) * sa2 * sb2 +
-                         F8(1.2f * 0.3f) * cc +
-                         F8(-4.5f * 0.25f) * sa3 * sb3);
-
+    F8 dx, dz;
+    waterSlope8(px, pz, time, dx, dz);
     F8 invLen = F8(1.0f) / sqrt8(dx * dx + dz * dz + F8(1.0f));
     nx = -dx * invLen;
     ny = invLen;
     nz = -dz * invLen;
+}
+
+// Water surface normal (pointing up) at one point
+inline Vec3 getWaterNormal(const Vec3& pos, float time) {
+    F8 dx, dz;
+    waterSlope8(F8(pos.x), F8(pos.z), time, dx, dz);
+    return Vec3(-_mm256_cvtss_f32(dx.v), 1.0f, -_mm256_cvtss_f32(dz.v)).normalize();
 }
 
 // Get sky color
@@ -1668,16 +1778,269 @@ Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun, bo
     return skyGradient;
 }
 
-// Calculate volumetrics. The 12 shadow rays all point at the sun, so they are
-// marched as SIMD packets (raycastShadow8) and the per-sample attenuation math
-// runs 8-wide. One behavior fix vs the scalar original: when a shadow ray hit
-// nothing, the old code read an uninitialized hitBlock (UB); a miss is now a
-// defined "sun fully visible".
+// ============================================================
+// Water as a medium
+// ============================================================
+
+// Light lost per block of water travelled, per color. Red goes first, which is
+// what turns shallow water turquoise and deep water blue.
+static const float WATER_EXTINCTION[3] = {0.150f, 0.060f, 0.038f};
+// Light scattered many times inside the water: the color a long look through it fades to
+static const Vec3 WATER_GLOW(0.035f, 0.300f, 0.480f);
+constexpr float WATER_SCATTER = 0.300f;        // single scattering toward the eye (light shafts)
+constexpr float PARTICLE_BRIGHTNESS = 2.5f;
+// Artistic: sunlight under water is shown brighter than it physically is (as
+// if the eye had adapted), so caustics and shafts read as bright, dancing light.
+constexpr float UNDERWATER_SUN_GAIN = 3.0f;
+
+// Fraction of light that survives `dist` blocks of water, per color
+inline Vec3 waterTransmittance(float dist) {
+    alignas(32) float e[8] = {-WATER_EXTINCTION[0] * dist, -WATER_EXTINCTION[1] * dist,
+                              -WATER_EXTINCTION[2] * dist, 0, 0, 0, 0, 0};
+    exp8(F8::load(e)).store(e);
+    return Vec3(e[0], e[1], e[2]);
+}
+
+// The water's own glow at a height: brighter near the surface, tied to the sun
+inline Vec3 waterGlow(float y, const SunLight& sun) {
+    float depth = std::max(0.0f, float(WATER_LEVEL) - y);
+    return WATER_GLOW * (sun.intensity * (0.35f + 0.65f * std::exp(-depth * 0.12f)));
+}
+
+// ============================================================
+// Caustic map
+//
+// Sunlight is refracted by the waves and lands unevenly on whatever is below:
+// bright lines where the surface focuses it, dimmer patches between. Once per
+// frame, light is sent down from a fine grid of points on the surface and
+// collected in a stack of horizontal layers, one per block of depth. A value
+// of 1 means "as much light as under flat water"; focused lines are above 1.
+// Lookups are then a few texture reads, with no noise, at any depth.
+// ============================================================
+class CausticMap {
+public:
+    static constexpr int MARGIN = 12;                 // blocks of surface simulated beyond the world edge
+    static constexpr int LAYERS = WATER_LEVEL + 1;    // depths 0 .. WATER_LEVEL
+
+    bool ready() const { return !data.empty(); }
+    int texels() const { return size; }
+    const float* layer(int d) const { return &data[size_t(d) * size * size]; }
+
+    void update(const World& world, const SunLight& sun, float time, int texelsPerBlock) {
+        if (ready() && res == texelsPerBlock && time == builtTime && world.getGeneration() == builtWorld &&
+            sun.direction.x == builtSun.x && sun.direction.y == builtSun.y && sun.direction.z == builtSun.z) {
+            return;
+        }
+        res = texelsPerBlock;
+        size = WORLD_SIZE * res;
+        builtTime = time;
+        builtWorld = world.getGeneration();
+        builtSun = sun.direction;
+        data.assign(size_t(LAYERS) * size * size, 0.0f);
+
+        // Photons: a grid over the surface, 2 x 2 per texel
+        const int perTexel = 2;
+        const float spacing = 1.0f / float(res * perTexel);
+        const int np = (WORLD_SIZE + 2 * MARGIN) * res * perTexel;        // per side; a multiple of 8
+        offX.resize(size_t(np) * np);
+        offZ.resize(size_t(np) * np);
+        weight.resize(size_t(np) * np);
+
+        const Vec3 incident = sun.direction;
+        const float ratio = 1.0f / WATER_IOR;
+        const float cosFlat = std::max(1e-3f, -incident.y);
+        const float flatFlux = cosFlat * (1.0f - (0.02f + 0.98f * std::pow(1.0f - cosFlat, 5.0f)));
+
+        int threads = g_settings.threads > 0 ? g_settings.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+
+        // 1. Refract every photon through the surface: where it lands per block
+        //    of depth, and how much light it carries relative to flat water.
+        auto refractRows = [&](int j0, int j1) {
+            alignas(32) float wxs[8], mask[8], ox[8], oz[8], wg[8];
+            for (int j = j0; j < j1; j++) {
+                float wz = -float(MARGIN) + (j + 0.5f) * spacing;
+                int bz = static_cast<int>(std::floor(wz));
+                for (int i = 0; i < np; i += 8) {
+                    bool any = false;
+                    for (int k = 0; k < 8; k++) {
+                        wxs[k] = -float(MARGIN) + (i + k + 0.5f) * spacing;
+                        bool water = world.waterSurfaceAt(static_cast<int>(std::floor(wxs[k])), bz);
+                        mask[k] = water ? 1.0f : 0.0f;
+                        any = any || water;
+                    }
+                    float* dox = &offX[size_t(j) * np + i];
+                    float* doz = &offZ[size_t(j) * np + i];
+                    float* dw = &weight[size_t(j) * np + i];
+                    if (!any) {
+                        for (int k = 0; k < 8; k++) { dox[k] = 0; doz[k] = 0; dw[k] = 0; }
+                        continue;
+                    }
+                    F8 nx, ny, nz;
+                    waterNormal8(F8::load(wxs), F8(wz), time, nx, ny, nz);
+                    F8 cosI = -(nx * F8(incident.x) + ny * F8(incident.y) + nz * F8(incident.z));
+                    F8 valid = cmpge8(cosI, F8(0.01f));                       // grazing light is reflected away
+                    F8 sinT2 = F8(ratio * ratio) * (F8(1.0f) - cosI * cosI);
+                    F8 cosT = sqrt8(max8(F8(1.0f) - sinT2, F8(0.0f)));
+                    F8 rc = F8(ratio) * cosI - cosT;
+                    F8 rx = F8(incident.x * ratio) + nx * rc;
+                    F8 ry = F8(incident.y * ratio) + ny * rc;
+                    F8 rz = F8(incident.z * ratio) + nz * rc;
+                    valid = and8(valid, cmplt8(ry, F8(-0.01f)));              // must head down
+                    F8 invDown = F8(1.0f) / max8(-ry, F8(0.01f));
+                    // Flux through a tilted patch of surface: cos(incidence) * area (1 / ny), times transmission
+                    F8 om = F8(1.0f) - min8(cosI, F8(1.0f));
+                    F8 om2 = om * om;
+                    F8 fresnel = F8(0.02f) + F8(0.98f) * om2 * om2 * om;
+                    F8 flux = cosI * (F8(1.0f) - fresnel) / max8(ny, F8(0.05f)) * F8(1.0f / flatFlux);
+                    (rx * invDown).store(ox);
+                    (rz * invDown).store(oz);
+                    and8(flux, valid).store(wg);
+                    for (int k = 0; k < 8; k++) { dox[k] = ox[k]; doz[k] = oz[k]; dw[k] = wg[k] * mask[k]; }
+                }
+            }
+        };
+        runParallel(np, threads, refractRows);
+
+        // 2. One layer per depth: drop each photon where it lands, then soften.
+        auto buildLayers = [&](int d0, int d1) {
+            std::vector<float> tmp(size_t(size) * size);
+            for (int d = d0; d < d1; d++) {
+                float* layer = &data[size_t(d) * size * size];
+                const float scale = 1.0f / float(perTexel * perTexel);
+                for (int j = 0; j < np; j++) {
+                    float wz = -float(MARGIN) + (j + 0.5f) * spacing;
+                    const float* pox = &offX[size_t(j) * np];
+                    const float* poz = &offZ[size_t(j) * np];
+                    const float* pw = &weight[size_t(j) * np];
+                    for (int i = 0; i < np; i++) {
+                        float w = pw[i];
+                        if (w <= 0.0f) continue;
+                        float wx = -float(MARGIN) + (i + 0.5f) * spacing;
+                        float fx = (wx + pox[i] * d) * res - 0.5f;
+                        float fz = (wz + poz[i] * d) * res - 0.5f;
+                        int ix = static_cast<int>(std::floor(fx));
+                        int iz = static_cast<int>(std::floor(fz));
+                        if (ix < -1 || ix >= size || iz < -1 || iz >= size) continue;
+                        float tx = fx - ix, tz = fz - iz;
+                        w *= scale;
+                        if (iz >= 0) {
+                            if (ix >= 0) layer[size_t(iz) * size + ix] += w * (1 - tx) * (1 - tz);
+                            if (ix + 1 < size) layer[size_t(iz) * size + ix + 1] += w * tx * (1 - tz);
+                        }
+                        if (iz + 1 < size) {
+                            if (ix >= 0) layer[size_t(iz + 1) * size + ix] += w * (1 - tx) * tz;
+                            if (ix + 1 < size) layer[size_t(iz + 1) * size + ix + 1] += w * tx * tz;
+                        }
+                    }
+                }
+                // The sun is not a point and water scatters: the pattern softens with depth
+                blur(layer, tmp.data(), res * (0.04f + 0.014f * d));
+            }
+        };
+        runParallel(LAYERS, threads, buildLayers);
+    }
+
+    // Light at (x, z) and a depth below the surface, relative to flat water
+    float sample(float x, float z, float depth) const {
+        float fd = std::min(float(LAYERS - 1), std::max(0.0f, depth));
+        int d0 = std::min(LAYERS - 2, static_cast<int>(fd));
+        float td = fd - d0;
+        float fx = std::min(float(size - 1), std::max(0.0f, x * res - 0.5f));
+        float fz = std::min(float(size - 1), std::max(0.0f, z * res - 0.5f));
+        int ix = std::min(size - 2, static_cast<int>(fx));
+        int iz = std::min(size - 2, static_cast<int>(fz));
+        float tx = fx - ix, tz = fz - iz;
+        const float* a = &data[(size_t(d0) * size + iz) * size + ix];
+        const float* b = a + size_t(size) * size;
+        float la = (a[0] * (1 - tx) + a[1] * tx) * (1 - tz) + (a[size] * (1 - tx) + a[size + 1] * tx) * tz;
+        float lb = (b[0] * (1 - tx) + b[1] * tx) * (1 - tz) + (b[size] * (1 - tx) + b[size + 1] * tx) * tz;
+        return la * (1 - td) + lb * td;
+    }
+
+private:
+    int res = 0, size = 0;
+    std::vector<float> data;                 // LAYERS x size x size
+    std::vector<float> offX, offZ, weight;   // photons
+    float builtTime = 0.0f;
+    uint64_t builtWorld = 0;
+    Vec3 builtSun;
+
+    template <typename Fn>
+    static void runParallel(int count, int threads, Fn fn) {
+        threads = std::max(1, std::min(threads, count));
+        std::vector<std::thread> pool;
+        for (int t = 0; t < threads; t++) {
+            int begin = int(int64_t(count) * t / threads);
+            int end = int(int64_t(count) * (t + 1) / threads);
+            pool.emplace_back([=]() { fn(begin, end); });
+        }
+        for (auto& th : pool) th.join();
+    }
+
+    // Separable Gaussian blur of one layer (sigma in texels)
+    void blur(float* layer, float* tmp, float sigma) const {
+        if (sigma < 0.3f) return;
+        int radius = std::min(12, static_cast<int>(std::ceil(sigma * 2.5f)));
+        float kernel[25];
+        float sum = 0.0f;
+        for (int k = -radius; k <= radius; k++) {
+            kernel[k + radius] = std::exp(-0.5f * k * k / (sigma * sigma));
+            sum += kernel[k + radius];
+        }
+        for (int k = 0; k <= 2 * radius; k++) kernel[k] /= sum;
+        for (int pass = 0; pass < 2; pass++) {
+            const float* src = pass == 0 ? layer : tmp;
+            float* dst = pass == 0 ? tmp : layer;
+            for (int v = 0; v < size; v++) {
+                for (int u = 0; u < size; u++) {
+                    // pass 0 blurs along x (u is x), pass 1 along z (u is z)
+                    int x = pass == 0 ? u : v, z = pass == 0 ? v : u;
+                    float acc = 0.0f;
+                    for (int k = -radius; k <= radius; k++) {
+                        int q = std::min(size - 1, std::max(0, u + k));
+                        int idx = pass == 0 ? z * size + q : q * size + x;
+                        acc += src[idx] * kernel[k + radius];
+                    }
+                    dst[size_t(z) * size + x] = acc;
+                }
+            }
+        }
+    }
+};
+
+CausticMap g_caustics;
+
+// Caustic light at a point, relative to flat water, with the strength setting applied
+inline float causticAt(float x, float z, float depth) {
+    if (!g_settings.enableCaustics || !g_caustics.ready()) return 1.0f;
+    float c = g_caustics.sample(x, z, depth);
+    return std::max(0.0f, 1.0f + (c - 1.0f) * g_settings.causticStrength);
+}
+
+// The same per color. Water bends blue slightly more than red, so the three
+// colors land a little apart, more so with depth: faint colored fringes.
+inline Vec3 causticColor(float x, float z, float depth, const SunLight& sun) {
+    float hx = sun.refracted.x, hz = sun.refracted.z;
+    float len = std::sqrt(hx * hx + hz * hz);
+    if (len < 1e-4f) { hx = 1.0f; hz = 0.0f; len = 1.0f; }
+    float shift = 0.012f * depth / len;
+    return Vec3(causticAt(x - hx * shift, z - hz * shift, depth),
+                causticAt(x, z, depth),
+                causticAt(x + hx * shift, z + hz * shift, depth));
+}
+
+// Calculate volumetrics: sunlight scattered toward the eye along a ray. The
+// shadow rays all point at the sun, so they are marched as SIMD packets
+// (raycastShadow8).
 //
 // fullQuality marches all 12 steps (rays the camera sees directly or through
 // water). Otherwise one randomly chosen step is evaluated and scaled by 12: the
 // average is the same, at a twelfth of the work, and the extra noise lands on
 // indirect light where it is not visible.
+//
+// In water each step is lit through the caustic map, so the haze breaks into
+// shafts that line up with the bright lines on the lake bed, and both the
+// light's way down and the way to the eye lose light per color.
 Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater,
                           bool fullQuality) {
     if (!g_settings.enableVolumetrics) return Vec3(0, 0, 0);
@@ -1685,13 +2048,12 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     const int numSamples = 12;
     const int evaluated = fullQuality ? numSamples : 1;
     const int firstStep = fullQuality ? 0 : std::min(numSamples - 1, int(random01() * numSamples));
-    float stepSize = std::min(maxDist, 50.0f) / float(numSamples);
+    // Water is murkier than air, so its shafts are sampled over a shorter stretch
+    float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
 
-    float scatteringCoeff = inWater ? 0.2f : 0.04f;
-    float absorptionCoeff = inWater ? 0.08f : 0.01f;
-
-    float cosTheta = ray.direction.dot(-sun.direction);
-    float g = inWater ? 0.8f : 0.6f;
+    float cosTheta = ray.direction.dot(inWater ? -sun.refracted : -sun.direction);
+    // Water scatters less sharply forward than haze, so shafts also show from the side
+    float g = inWater ? 0.5f : 0.6f;
     float phase = (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
 
     // Jittered sample positions along the ray (SoA, padded to 2 groups of 8)
@@ -1714,8 +2076,9 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         laneActive[i] = false;
     }
 
+    // How much sun reaches each sample: 1, 0.3 through leaves, 0 behind solid blocks
     Vec3 toSun = -sun.direction;
-    float total = 0.0f;
+    alignas(32) float visible[16];
     const int groups = (evaluated + 7) / 8;
     for (int group = 0; group < groups; group++) {
         int base = group * 8;
@@ -1727,180 +2090,120 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
             world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
                                  laneActive + base, hitBlock);
         }
-
-        alignas(32) float lane[8];
         for (int L = 0; L < 8; L++) {
-            if (!laneActive[base + L]) { lane[L] = 0.0f; continue; }
             uint8_t hb = hitBlock[L];
-            float intensity = sun.intensity;
-            if (hb == AIR) {                          // nothing solid in the way: sun visible
-            } else if (hb == LEAVES) {
-                intensity *= 0.3f;
-            } else {
-                intensity = 0.0f;                     // blocked by solid geometry
-            }
-            lane[L] = intensity;
+            visible[base + L] = !laneActive[base + L] ? 0.0f : hb == AIR ? 1.0f : hb == LEAVES ? 0.3f : 0.0f;
         }
-
-        F8 li = F8::load(lane);
-        F8 yv = F8::load(sy + base);
-        F8 att;
-        if (inWater) {
-            F8 depth = max8(F8(0.0f), F8(11.0f) - yv);
-            att = exp8(depth * F8(-0.05f));
-        } else {
-            F8 heightFactor = exp8((yv - F8(10.0f)) * F8(-0.02f));
-            att = min8(F8(1.0f), max8(F8(0.1f), heightFactor));
-        }
-        F8 absorption = exp8(F8::load(ts + base) * F8(-absorptionCoeff));
-        total += hsum8(li * att * absorption);
     }
-    total *= float(numSamples) / float(evaluated);
-
-    Vec3 volumetricLight = sun.color * (total * scatteringCoeff * phase * stepSize);
+    const float scaleUp = float(numSamples) / float(evaluated);
 
     if (inWater) {
-        volumetricLight = volumetricLight * Vec3(0.7f, 0.9f, 1.0f);
-    } else {
-        float timeStrength = 1.0f + 2.0f * (1.0f - std::abs(g_settings.timeOfDay - 0.5f) * 2.0f);
-        volumetricLight = volumetricLight * Vec3(1.0f, 0.95f, 0.9f) * timeStrength;
+        const float invDown = 1.0f / std::max(0.05f, -sun.refracted.y);
+        Vec3 sum(0, 0, 0);
+        for (int i = 0; i < evaluated; i++) {
+            if (visible[i] <= 0.0f) continue;
+            float depth = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
+            float light = visible[i] * causticAt(sx[i], sz[i], depth);
+            // Sun to the sample (slanted path down), then sample to the eye
+            sum += waterTransmittance(depth * invDown + ts[i]) * light;
+        }
+        return sun.getLightContribution() * sum *
+               (scaleUp * sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize *
+                g_settings.shaftStrength);
     }
 
-    return volumetricLight * 3.0f;
+    // Air: haze that thins with height
+    float total = 0.0f;
+    for (int group = 0; group < groups; group++) {
+        int base = group * 8;
+        F8 li = F8::load(visible + base) * F8(sun.intensity);
+        F8 heightFactor = exp8((F8::load(sy + base) - F8(10.0f)) * F8(-0.02f));
+        F8 att = min8(F8(1.0f), max8(F8(0.1f), heightFactor));
+        F8 absorption = exp8(F8::load(ts + base) * F8(-0.01f));
+        total += hsum8(li * att * absorption);
+    }
+    total *= scaleUp;
+    float timeStrength = 1.0f + 2.0f * (1.0f - std::abs(g_settings.timeOfDay - 0.5f) * 2.0f);
+    Vec3 volumetricLight = sun.color * (total * 0.04f * phase * stepSize);
+    return volumetricLight * Vec3(1.0f, 0.95f, 0.9f) * (timeStrength * 3.0f);
 }
 
-// Physically-based caustics calculation
-// fullQuality uses the configured sample count (surfaces the camera sees);
-// otherwise 8 samples, which is enough for light that only arrives indirectly.
-float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun, float time, bool fullQuality) {
-    if (!g_settings.enableCaustics) return 0.0f;
-    
-    // Early exit if above water
-    if (pos.y > 11.0f) return 0.0f;
-    
-    // Check if position is underwater
-    int checkX = static_cast<int>(std::floor(pos.x));
-    int checkY = static_cast<int>(std::floor(pos.y));
-    int checkZ = static_cast<int>(std::floor(pos.z));
-    
-    bool underWater = false;
-    for (int y = checkY; y <= 11 && y < WORLD_HEIGHT; y++) {
-        if (world.getBlock(checkX, y, checkZ) == WATER) {
-            underWater = true;
-            break;
+// Specks drifting in the water, lit by the sun through the caustic map. Each
+// block of water holds a few of them at hashed positions; a ray picks up the
+// ones it passes close to. Only the first stretch of a ray is checked, and
+// only for a camera that is itself under water.
+Vec3 waterParticles(const Ray& ray, float maxDist, const World& world, const SunLight& sun) {
+    const float reach = std::min(maxDist, 10.0f);
+    const float pixel = 2.0f * std::tan(FOV * float(M_PI) / 360.0f) / float(g_settings.renderHeight);
+    const float invDown = 1.0f / std::max(0.05f, -sun.refracted.y);
+    const float time = g_settings.waterAnimation;
+    const Vec3 o = ray.origin, dir = ray.direction;
+
+    int x = static_cast<int>(std::floor(o.x));
+    int y = static_cast<int>(std::floor(o.y));
+    int z = static_cast<int>(std::floor(o.z));
+    int stepX = dir.x > 0 ? 1 : -1, stepY = dir.y > 0 ? 1 : -1, stepZ = dir.z > 0 ? 1 : -1;
+    float tMaxX = (dir.x != 0) ? ((x + (stepX > 0 ? 1 : 0)) - o.x) / dir.x : 1e30f;
+    float tMaxY = (dir.y != 0) ? ((y + (stepY > 0 ? 1 : 0)) - o.y) / dir.y : 1e30f;
+    float tMaxZ = (dir.z != 0) ? ((z + (stepZ > 0 ? 1 : 0)) - o.z) / dir.z : 1e30f;
+    float tDeltaX = (dir.x != 0) ? stepX / dir.x : 1e30f;
+    float tDeltaY = (dir.y != 0) ? stepY / dir.y : 1e30f;
+    float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
+
+    Vec3 sum(0, 0, 0);
+    float dist = 0.0f;
+    while (dist < reach) {
+        if (y < WATER_LEVEL && world.getBlock(x, y, z) == WATER) {
+            for (uint32_t k = 0; k < 3; k++) {
+                uint32_t h = hashCell(x, y, z, 0x51ed270bU + k);
+                Vec3 p(x + hashFloat(h), y + hashFloat(hash32(h + 1)), z + hashFloat(hash32(h + 2)));
+                Vec3 v = p - o;
+                float t = v.dot(dir);
+                if (t < 0.6f || t > reach + 0.5f) continue;
+                if (v.dot(v) - t * t > 0.09f) continue;                 // not near the ray, even after drifting
+                // Slow drift
+                float ph = hashFloat(hash32(h + 3)) * 6.2831853f;
+                p = p + Vec3(0.12f * std::sin(time * 0.35f + ph), 0.08f * std::sin(time * 0.27f + ph * 1.7f),
+                             0.12f * std::cos(time * 0.31f + ph));
+                if (p.y > float(WATER_LEVEL) - 0.05f) continue;
+                v = p - o;
+                t = v.dot(dir);
+                if (t < 0.6f || t > reach) continue;
+                float perp2 = std::max(0.0f, v.dot(v) - t * t);
+                float radius = 0.0015f + 0.0035f * hashFloat(hash32(h + 4));
+                float foot = 0.6f * pixel * t;                          // about half a pixel at that distance
+                float r2 = radius * radius + foot * foot;
+                if (perp2 > 6.0f * r2) continue;
+                float depth = float(WATER_LEVEL) - p.y;
+                // Smaller than a pixel: spread over the pixel, keeping its total light
+                float glint = std::exp(-perp2 / (2.0f * r2)) * (radius * radius / r2);
+                sum += waterTransmittance(depth * invDown + t) * (causticAt(p.x, p.z, depth) * glint);
+            }
         }
+        if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += stepX; dist = tMaxX; tMaxX += tDeltaX; }
+        else if (tMaxY < tMaxZ) { y += stepY; dist = tMaxY; tMaxY += tDeltaY; }
+        else { z += stepZ; dist = tMaxZ; tMaxZ += tDeltaZ; }
     }
-    
-    if (!underWater) return 0.0f;
-    
-    float causticIntensity = 0.0f;
-    
-    // Number of samples based on quality setting
-    int samples = 8;  // Default low quality
-    switch(g_settings.causticQuality) {
-        case 1: samples = 8; break;   // Low - fast
-        case 2: samples = 16; break;  // Medium - balanced
-        case 3: samples = 32; break;  // High - for offline rendering
-    }
-    
-    // For offline rendering, always use high quality
-    if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
-        samples = 32;
-    }
-    if (!fullQuality) {
-        samples = 8;
-    }
-    
-    // Sample area size - smaller = sharper caustics
-    float sampleRadius = 1.5f;
-    
-    // 8 samples per iteration: stratified sample points, water normals, Snell
-    // refraction and Gaussian falloff all run 8-wide (sample counts 8/16/32 are
-    // multiples of 8). Lanes that graze the surface, totally internally reflect
-    // or refract upward are masked out of the sum, matching the scalar branches.
-    const Vec3 incident = sun.direction;
-    const float ratio = 1.0f / 1.333f;   // air -> water
-    const F8 laneIdx(_mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7));
-    alignas(32) float rndA[8], rndB[8];
-
-    for (int i = 0; i < samples; i += 8) {
-        for (int k = 0; k < 8; k++) {
-            rndA[k] = random01();
-            rndB[k] = random01();
-        }
-
-        // Sample points on the water surface above (stratified)
-        F8 angle = (F8(float(i)) + laneIdx + F8::load(rndA)) * F8(2.0f * float(M_PI) / float(samples));
-        F8 radius = sqrt8(F8::load(rndB)) * F8(sampleRadius);
-        F8 sinA, cosA;
-        sincos8(angle, sinA, cosA);
-        F8 wx = F8(pos.x) + radius * cosA;
-        F8 wz = F8(pos.z) + radius * sinA;
-
-        F8 nx, ny, nz;
-        waterNormal8(wx, wz, time, nx, ny, nz);
-
-        // Snell's law per lane
-        F8 cosI = -(nx * F8(incident.x) + ny * F8(incident.y) + nz * F8(incident.z));
-        F8 valid = cmpge8(cosI, F8(0.01f));                  // grazing rays drop out
-
-        F8 sinT2 = F8(ratio * ratio) * (F8(1.0f) - cosI * cosI);
-        valid = and8(valid, cmple8(sinT2, F8(1.0f)));        // total internal reflection drops out
-
-        F8 cosT = sqrt8(max8(F8(1.0f) - sinT2, F8(0.0f)));
-        F8 rc = F8(ratio) * cosI - cosT;
-        F8 rx = F8(incident.x * ratio) + nx * rc;
-        F8 ry = F8(incident.y * ratio) + ny * rc;
-        F8 rz = F8(incident.z * ratio) + nz * rc;
-        F8 invLen = F8(1.0f) / max8(sqrt8(rx * rx + ry * ry + rz * rz), F8(1e-20f));
-        rx = rx * invLen;
-        ry = ry * invLen;
-        rz = rz * invLen;
-        valid = and8(valid, cmplt8(ry, F8(-0.01f)));         // ray must be going down
-
-        // Where the refracted ray crosses our depth; Gaussian falloff + focusing
-        F8 t = (F8(pos.y) - F8(11.0f)) / min8(ry, F8(-1e-20f));
-        F8 dx = wx + rx * t - F8(pos.x);
-        F8 dz = wz + rz * t - F8(pos.z);
-        F8 contribution = exp8((dx * dx + dz * dz) * F8(-4.0f));
-        contribution = contribution * (F8(1.0f) + (F8(1.0f) - abs8(ny)) * F8(2.0f));
-
-        causticIntensity += hsum8(and8(contribution, valid));
-    }
-    
-    // Normalize by sample count
-    causticIntensity /= float(samples);
-    
-    // Artistic adjustments
-    causticIntensity *= 12.0f;  // Overall brightness
-    
-    // Add sharp highlights
-    causticIntensity = std::pow(causticIntensity, 1.5f) * 1.5f;
-    
-    // Depth attenuation
-    float depth = 11.0f - pos.y;
-    float depthFade = std::exp(-depth * 0.02f);
-    
-    // Add subtle color variation based on intensity (chromatic aberration effect)
-    // This is applied in the main trace function
-    
-    return causticIntensity * depthFade * sun.intensity;
+    return sun.getLightContribution() * sum * (sun.beamGain * UNDERWATER_SUN_GAIN * PARTICLE_BRIGHTNESS);
 }
 
-// Path tracing (simplified for space, same as original)
+// Path tracing
+// insideWater: the ray travels through water (it then loses light per color and picks up the water's glow).
 // cameraPath: the ray comes from the camera, directly or through water
 // refraction/reflection (not after a diffuse bounce). Effects run at full quality on it.
-// hitDistOut (optional) receives the distance this ray travelled to its first hit.
 // lampFrom/bouncePdf: set on a diffuse bounce ray. The surface at *lampFrom has
 // already sampled the nearby light blocks directly; if this ray then hits one of
 // them, its glow is weighted against that sample so the light is not counted twice.
 Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, bool cameraPath = false,
-           float* hitDistOut = nullptr, const Vec3* lampFrom = nullptr, float bouncePdf = 0.0f);
+           const Vec3* lampFrom = nullptr, float bouncePdf = 0.0f);
 
-// Brightness of a light block (they are dimmer in the middle of the day)
-inline Vec3 lampEmission() {
-    float brightness = 0.3f + 0.7f * std::abs(g_settings.timeOfDay - 0.5f) * 2.0f;
-    return g_materials[LIGHT].emission * brightness;
+// Light given off by a block (lamps are dimmer in the middle of the day)
+inline Vec3 lampEmission(BlockType block) {
+    if (block == LIGHT) {
+        float brightness = 0.3f + 0.7f * std::abs(g_settings.timeOfDay - 0.5f) * 2.0f;
+        return g_materials[LIGHT].emission * brightness;
+    }
+    return g_materials[block].emission;
 }
 
 // Minimal PNG writer: 8-bit RGB, stored (uncompressed) deflate blocks.
@@ -2024,6 +2327,14 @@ public:
         nextTile = 0;
         sampleCount++;
 
+        // Per-pass state shared by all render threads
+        g_sun.updateFromTimeOfDay(g_settings.timeOfDay);
+        if (g_settings.enableCaustics) {
+            static const int texelsPerBlock[3] = {2, 4, 8};
+            int quality = g_settings.mode == Settings::MODE_OFFLINE_RENDER ? 3 : g_settings.causticQuality;
+            g_caustics.update(world, g_sun, g_settings.waterAnimation, texelsPerBlock[quality - 1]);
+        }
+
         int numThreads = g_settings.threads > 0 ? g_settings.threads
                                                 : std::max(1u, std::thread::hardware_concurrency());
         std::vector<std::thread> threads;
@@ -2124,150 +2435,109 @@ public:
 };
 
 // Complete trace function implementation
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath, float* hitDistOut,
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath,
            const Vec3* lampFrom, float bouncePdf) {
-    if (hitDistOut) *hitDistOut = 0.0f;
     if (depth <= 0) return Vec3(0, 0, 0);
-    
-    SunLight sun;
-    sun.updateFromTimeOfDay(g_settings.timeOfDay);
-    
+
+    const SunLight& sun = g_sun;
+
     Vec3 hitPos, hitNormal;
     BlockType hitBlock;
-    
+
     // Calculate distance to hit (or max distance if no hit)
     float hitDistance = MAX_RAY_DISTANCE;
     bool didHit = world.raycast(ray, MAX_RAY_DISTANCE, hitPos, hitNormal, hitBlock);
     if (didHit) {
         hitDistance = (hitPos - ray.origin).length();
     }
-    if (hitDistOut) *hitDistOut = hitDistance;
-    
-    // Calculate volumetric lighting along the ray
+
+    // Light scattered toward the eye along the ray: haze and shafts, and specks in water
     Vec3 volumetrics(0, 0, 0);
     if (g_settings.enableVolumetrics) {
         volumetrics = calculateVolumetrics(ray, hitDistance, world, sun, insideWater, cameraPath);
     }
-    
-    if (!didHit) {
-        if (insideWater) {
-            float depth = std::max(0.0f, 11.0f - ray.origin.y);
-            float depthFactor = std::exp(-depth * 0.08f);
-            // Tropical blue-green underwater ambience
-            Vec3 baseColor = Vec3(0.02f, 0.08f, 0.12f) * (0.4f + 0.6f * depthFactor);
-            return baseColor + volumetrics;
-        }
-        
-        Vec3 skyColor = getSkyColor(ray.direction, g_settings.timeOfDay, sun, cameraPath);
-        return skyColor + volumetrics;
+    if (insideWater && depth == MAX_BOUNCES && g_settings.enableParticles) {
+        volumetrics += waterParticles(ray, hitDistance, world, sun);     // camera under water, its own rays only
     }
-    
-    const MaterialProps& mat = g_materials[hitBlock];
-    
-    // Handle water
+
+    // Every ray ends here: `light` is what arrives at the far end. In water it
+    // loses light per color on the way (red first) and the water's own glow
+    // takes its place, so distant things fade into blue.
+    auto finish = [&](const Vec3& light) {
+        if (!insideWater) return light + volumetrics;
+        Vec3 through = waterTransmittance(hitDistance);
+        float glowY = ray.origin.y + ray.direction.y * std::min(hitDistance, 6.0f) * 0.5f;
+        return light * through + waterGlow(glowY, sun) * (Vec3(1, 1, 1) - through) + volumetrics;
+    };
+
+    if (!didHit) {
+        if (insideWater) return finish(Vec3(0, 0, 0));
+        return finish(getSkyColor(ray.direction, g_settings.timeOfDay, sun, cameraPath));
+    }
+
+    // Water surface, from either side
     if (hitBlock == WATER) {
-        bool entering = !insideWater;
-        Vec3 normal = entering ? hitNormal : hitNormal * -1;
-        
-        // Add waves on top surface
-        if (entering && hitNormal.y > 0.9f) {
-            Vec3 waveNormal = getWaterNormal(hitPos, g_settings.waterAnimation);
-            normal = (normal * 0.8f + waveNormal * 0.2f).normalize();
+        bool fromAbove = !insideWater;
+        Vec3 normal = hitNormal;                    // faces the incoming ray
+
+        // Waves on the top surface, seen from above or below
+        if (std::abs(hitNormal.y) > 0.9f) {
+            normal = getWaterNormal(hitPos, g_settings.waterAnimation);             // points up
+            if (!fromAbove) normal = normal * -1.0f;
         }
-        
-        float n1 = entering ? 1.0f : 1.333f;
-        float n2 = entering ? 1.333f : 1.0f;
-        float n = n1 / n2;
-        
+
+        float eta = fromAbove ? 1.0f / WATER_IOR : WATER_IOR;
         float cosI = -normal.dot(ray.direction);
-        float sinT2 = n * n * (1.0f - cosI * cosI);
-        
-        Vec3 refractedDir;
-        bool totalInternalReflection = false;
-        
-        if (sinT2 <= 1.0f) {
-            float cosT = std::sqrt(1.0f - sinT2);
-            refractedDir = ray.direction * n + normal * (n * cosI - cosT);
-        } else {
-            totalInternalReflection = true;
-            refractedDir = ray.direction - normal * 2.0f * ray.direction.dot(normal);
+        if (cosI < 0.0f) {                          // a wave tilted past the ray: treat as grazing
+            normal = normal * -1.0f;
+            cosI = -cosI;
         }
-        
-        Vec3 offsetPos = hitPos + refractedDir * 0.01f;
-        Ray refractedRay(offsetPos, refractedDir);
-        bool rayNowInsideWater = entering && !totalInternalReflection;
+        float sinT2 = eta * eta * (1.0f - cosI * cosI);
+        bool totalInternalReflection = sinT2 > 1.0f;       // only possible from below
 
-        // Fresnel reflectance for water surface
-        float r0 = ((n1 - n2) / (n1 + n2)) * ((n1 - n2) / (n1 + n2));
-        float reflectance = r0 + (1.0f - r0) * std::pow(1.0f - std::abs(cosI), 5.0f);
-
-        // Reflections only when looking at water from above
-        bool reflects = false;
-        if (!insideWater && !totalInternalReflection) {
-            reflectance = std::min(reflectance, 0.8f);  // Reduced max reflectance for more water color
-            reflects = reflectance > 0.02f;
+        Vec3 reflectedDir = ray.direction + normal * (2.0f * cosI);
+        Vec3 refractedDir = reflectedDir;
+        float reflectance = 1.0f;
+        if (!totalInternalReflection) {
+            float cosT = std::sqrt(1.0f - sinT2);
+            refractedDir = ray.direction * eta + normal * (eta * cosI - cosT);
+            // Fresnel (Schlick), using the angle on the air side
+            float r0 = ((1.0f - WATER_IOR) / (1.0f + WATER_IOR)) * ((1.0f - WATER_IOR) / (1.0f + WATER_IOR));
+            reflectance = r0 + (1.0f - r0) * std::pow(1.0f - (fromAbove ? cosI : cosT), 5.0f);
+            if (fromAbove) reflectance = std::min(reflectance, 0.8f);  // Reduced max reflectance for more water color
         }
 
         // A light block reached through the water was already sampled directly
         // by the surface the ray came from (bouncePdf 0 drops its glow here).
-        auto traceTransmitted = [&]() {
-            float waterDistance = 0.0f;             // how far the refracted ray travels in the water
-            Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, cameraPath, &waterDistance,
-                                     lampFrom, 0.0f);
-            // Water absorption with tropical blue tint
-            if (entering && !totalInternalReflection) {
-                Vec3 waterTint(0.05f, 0.25f, 0.35f);
-                float absorption = std::exp(-waterDistance * 0.08f);  // Stronger absorption for more color
-                transmitted = transmitted * absorption + waterTint * (1.0f - absorption) * 0.4f;
-            }
-            return transmitted;
+        auto traceRefracted = [&]() {
+            Ray refractedRay(hitPos + refractedDir * 0.01f, refractedDir);
+            return trace(refractedRay, world, depth - 1, fromAbove, cameraPath, lampFrom, 0.0f);
         };
         auto traceReflected = [&]() {
-            Vec3 reflectedDir = ray.direction - normal * 2.0f * ray.direction.dot(normal);
             Ray reflectedRay(hitPos + normal * 0.01f, reflectedDir);
-            return trace(reflectedRay, world, depth - 1, false, cameraPath, nullptr, lampFrom, 0.0f);
+            return trace(reflectedRay, world, depth - 1, insideWater, cameraPath, lampFrom, 0.0f);
         };
 
-        Vec3 waterColor(0.1f, 0.35f, 0.45f);       // Always show some water color with reflections
-        if (reflects && !cameraPath) {
+        Vec3 result;
+        if (totalInternalReflection) {
+            result = traceReflected();                      // the mirror around the window to the sky
+        } else if (cameraPath) {
+            // What the camera sees: both, weighted (the reflection only if it matters)
+            result = traceRefracted() * (1.0f - reflectance);
+            if (reflectance > 0.02f) result = result + traceReflected() * reflectance;
+        } else {
             // Indirect paths follow one of the two, chosen by the reflectance:
             // the same average as tracing both, at half the work.
-            Vec3 chosen = random01() < reflectance ? traceReflected() : traceTransmitted();
-            return chosen * 0.9f + waterColor * 0.1f + volumetrics;
+            result = random01() < reflectance ? traceReflected() : traceRefracted();
         }
-
-        Vec3 transmitted = traceTransmitted();
-        if (reflects) {
-            Vec3 reflected = traceReflected();
-            transmitted = transmitted * (1.0f - reflectance) + reflected * reflectance;
-            transmitted = transmitted * 0.9f + waterColor * 0.1f;
-        }
-        return transmitted + volumetrics;  // Add volumetrics
+        return finish(result);
     }
 
-    // Check if surface is underwater
-    bool actuallyUnderwater = false;
-    int checkX = static_cast<int>(std::floor(hitPos.x));
-    int checkY = static_cast<int>(std::floor(hitPos.y + 0.5f));
-    int checkZ = static_cast<int>(std::floor(hitPos.z));
-    
-    for (int y = checkY; y < WORLD_HEIGHT && y < checkY + 10; y++) {
-        if (world.getBlock(checkX, y, checkZ) == WATER) {
-            actuallyUnderwater = true;
-            break;
-        }
-    }
-    
-    bool isUnderwater = insideWater || actuallyUnderwater;
-    
-    // Handle emissive materials
-    Vec3 emission = mat.emission;
-    if (hitBlock == LIGHT) {
-        emission = lampEmission();
-        if (isUnderwater) {
-            float depth = std::max(0.0f, 11.0f - hitPos.y);
-            emission = emission * (0.7f * std::exp(-depth * 0.03f));
-        }
+    const MaterialProps& mat = g_materials[hitBlock];
+
+    // Light blocks: weighted against direct light sampling
+    if (isEmitter(hitBlock)) {
+        Vec3 emission = lampEmission(hitBlock);
         if (lampFrom) {
             // This ray is a diffuse bounce, and the surface it left also sampled
             // nearby light blocks directly. If this block was one of them, share
@@ -2287,127 +2557,121 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
                 }
             }
         }
+        return finish(emission);
     }
 
-    Vec3 color = emission;
+    // Does this face touch water? Then it is lit through the water.
+    Vec3 outside = hitPos + hitNormal * 0.5f;
+    bool wet = world.getBlock(static_cast<int>(std::floor(outside.x)),
+                              static_cast<int>(std::floor(outside.y)),
+                              static_cast<int>(std::floor(outside.z))) == WATER;
 
-    if (hitBlock != LIGHT) {
-        // Get the base albedo from material properties
-        Vec3 albedo = mat.albedo;
-        
-        // Apply procedural textures based on block type
-        switch(hitBlock) {
-            case DIRT:
-                albedo = getDirtTexture(hitPos, hitNormal);
-                break;
-            case GRASS:
-                albedo = getGrassTexture(hitPos, hitNormal);
-                break;
-            case SAND:
-                albedo = getSandTexture(hitPos, hitNormal);
-                break;
-            case STONE:
-                albedo = getStoneTexture(hitPos, hitNormal);
-                break;
-            default:
-                // Use default material albedo for other block types
-                break;
-        }
-        
-        // Direct sun lighting (water does not block the sun; solid blocks do,
-        // including ones above the water when the surface is underwater)
-        Vec3 toSun = sun.direction * -1;
-        bool sunVisible = !world.sunOccluded(hitPos + hitNormal * 0.01f, toSun, 100.0f);
-        
-        float sunDot = std::max(0.0f, hitNormal.dot(toSun));
-        float sunStrength = sunDot * sun.intensity;
-        
-        if (isUnderwater) {
-            float depth = std::max(0.0f, 11.0f - hitPos.y);
-            float depthAttenuation = std::exp(-depth * 0.05f);
-            sunStrength *= 0.3f * depthAttenuation;
-        }
-        
-        Vec3 directLight = sunVisible ? sun.getLightContribution() * sunStrength : Vec3(0, 0, 0);
-        
-        // Add physically-based caustics
-        if (isUnderwater) {
-            float caustics = calculateCaustics(hitPos, world, sun, g_settings.waterAnimation, cameraPath);
-            
-            // Add chromatic aberration to caustics for realism
-            Vec3 causticsColor;
-            causticsColor.x = sun.color.x * (1.0f + caustics * 0.1f);
-            causticsColor.y = sun.color.y;
-            causticsColor.z = sun.color.z * (1.0f - caustics * 0.05f);
-            
-            directLight = directLight + causticsColor * caustics * 0.8f;
-        }
-        
-        // Direct light from nearby light blocks: one random point on one of them
-        Vec3 shadeOrigin = hitPos + hitNormal * 0.01f;
-        Vec3 lampLight(0, 0, 0);
-        const World::LightCell& cell = world.lightsNear(shadeOrigin);
-        if (g_settings.sampleLamps && cell.count > 0) {
-            const Vec3i& L = world.light(cell.index[std::min(cell.count - 1, int(random01() * cell.count))]);
-            int face = std::min(5, int(random01() * 6.0f));
-            int axis = face / 2;
-            float side = (face & 1) ? 1.0f : 0.0f;
-            float pt[3], faceNormal[3] = {0.0f, 0.0f, 0.0f};
-            pt[axis] = side;
-            pt[(axis + 1) % 3] = random01();
-            pt[(axis + 2) % 3] = random01();
-            faceNormal[axis] = side > 0.5f ? 1.0f : -1.0f;
-            Vec3 toLamp = Vec3(L.x + pt[0], L.y + pt[1], L.z + pt[2]) - shadeOrigin;
-            float dist2 = toLamp.dot(toLamp);
-            float dist = std::sqrt(dist2);
-            if (dist > 1e-3f) {
-                Vec3 wi = toLamp / dist;
-                float cosSurface = hitNormal.dot(wi);
-                float cosLight = -Vec3(faceNormal[0], faceNormal[1], faceNormal[2]).dot(wi);
-                if (cosSurface > 0.0f && cosLight > 0.0f &&
-                    world.firstSolid(shadeOrigin, wi, dist - 2e-3f) == AIR) {
-                    // Probability densities (per solid angle) of this direction for
-                    // the lamp sample and for the diffuse bounce; power heuristic.
-                    float lampPdf = dist2 / (cosLight * cell.count * 6.0f);
-                    float bouncePdfHere = cosSurface / float(M_PI);
-                    float weight = lampPdf * lampPdf / (lampPdf * lampPdf + bouncePdfHere * bouncePdfHere);
-                    lampLight = lampEmission() * (bouncePdfHere / lampPdf * weight);
-                }
+    // Get the base albedo from material properties
+    Vec3 albedo = mat.albedo;
+
+    // Apply procedural textures based on block type
+    switch(hitBlock) {
+        case DIRT:
+            albedo = getDirtTexture(hitPos, hitNormal);
+            break;
+        case GRASS:
+            albedo = getGrassTexture(hitPos, hitNormal);
+            break;
+        case SAND:
+            albedo = getSandTexture(hitPos, hitNormal);
+            break;
+        case STONE:
+            albedo = getStoneTexture(hitPos, hitNormal);
+            break;
+        case CORAL_PINK:
+        case CORAL_ORANGE:
+        case CORAL_PURPLE:
+            albedo = getCoralTexture(hitPos, mat.albedo);
+            break;
+        case KELP:
+            albedo = getKelpTexture(hitPos, mat.albedo);
+            break;
+        default:
+            // Use default material albedo for other block types
+            break;
+    }
+
+    Vec3 shadeOrigin = hitPos + hitNormal * 0.01f;
+    Vec3 toSun = sun.direction * -1;
+    Vec3 sunLight = sun.getLightContribution() * sun.intensity;
+    Vec3 directLight(0, 0, 0);
+
+    if (wet) {
+        // Sunlight through the water: it arrives along the refracted direction,
+        // focused and spread by the waves (the caustic map), and has lost light
+        // per color on its slanted way down. Blocks in the water or above the
+        // point where the light entered cast shadows.
+        Vec3 up = sun.refracted * -1.0f;
+        float cosSun = hitNormal.dot(up);
+        if (cosSun > 0.0f) {
+            float depthBelow = std::max(0.0f, float(WATER_LEVEL) - hitPos.y);
+            float pathLength = depthBelow / std::max(0.05f, up.y);
+            Vec3 entry = shadeOrigin + up * pathLength;
+            entry.y = float(WATER_LEVEL) + 0.02f;
+            bool sunVisible = world.firstSolid(shadeOrigin, up, pathLength) == AIR &&
+                              !world.sunOccluded(entry, toSun, 100.0f);
+            if (sunVisible) {
+                directLight = sunLight * causticColor(hitPos.x, hitPos.z, depthBelow, sun) *
+                              waterTransmittance(pathLength) * (sun.beamGain * UNDERWATER_SUN_GAIN * cosSun);
             }
         }
-
-        // Indirect lighting: one cosine-weighted bounce. With that distribution the
-        // bounce carries the full incoming light, so above water no fixed ambient
-        // term is needed: the sky and other surfaces fill the shadows.
-        Vec3 bounceDir = randomCosineDirection(hitNormal);
-        float cosBounce = std::max(1e-4f, hitNormal.dot(bounceDir));
-        Ray scattered(shadeOrigin, bounceDir);
-        Vec3 indirectLight = trace(scattered, world, depth - 1, isUnderwater, false, nullptr,
-                                   g_settings.sampleLamps ? &shadeOrigin : nullptr, cosBounce / float(M_PI));
-
-        if (isUnderwater) {
-            // Light scattered and absorbed inside the water is not simulated, so
-            // underwater surfaces keep an artistic model: a dimmed bounce plus a
-            // blue ambient that fades with depth. It is what gives the water its color.
-            Vec3 waterAmbient = Vec3(0.05f, 0.15f, 0.22f) *
-                                (0.3f + 0.7f * std::exp(-std::max(0.0f, 11.0f - hitPos.y) * 0.05f));
-            indirectLight = indirectLight * 0.2f + waterAmbient;
+    } else {
+        // Direct sun lighting (solid blocks cast shadows; water does not block the sun)
+        float sunDot = hitNormal.dot(toSun);
+        if (sunDot > 0.0f && !world.sunOccluded(shadeOrigin, toSun, 100.0f)) {
+            directLight = sunLight * sunDot;
         }
-
-        // Use the procedurally textured albedo in the final color calculation
-        color = color + albedo * (directLight + lampLight + indirectLight);
     }
 
-    // Underwater fog - tropical blue
-    if (isUnderwater) {
-        float distance = (hitPos - ray.origin).length();
-        float fogFactor = std::exp(-distance * 0.025f);  // Thicker fog for more color
-        Vec3 fogColor(0.04f, 0.18f, 0.28f);  // Tropical blue fog
-        color = color * fogFactor + fogColor * (1.0f - fogFactor);
+    // Direct light from nearby light blocks: one random point on one of them
+    Vec3 lampLight(0, 0, 0);
+    const World::LightCell& cell = world.lightsNear(shadeOrigin);
+    if (g_settings.sampleLamps && cell.count > 0) {
+        const Vec3i& L = world.light(cell.index[std::min(cell.count - 1, int(random01() * cell.count))]);
+        int face = std::min(5, int(random01() * 6.0f));
+        int axis = face / 2;
+        float side = (face & 1) ? 1.0f : 0.0f;
+        float pt[3], faceNormal[3] = {0.0f, 0.0f, 0.0f};
+        pt[axis] = side;
+        pt[(axis + 1) % 3] = random01();
+        pt[(axis + 2) % 3] = random01();
+        faceNormal[axis] = side > 0.5f ? 1.0f : -1.0f;
+        Vec3 toLamp = Vec3(L.x + pt[0], L.y + pt[1], L.z + pt[2]) - shadeOrigin;
+        float dist2 = toLamp.dot(toLamp);
+        float dist = std::sqrt(dist2);
+        if (dist > 1e-3f) {
+            Vec3 wi = toLamp / dist;
+            float cosSurface = hitNormal.dot(wi);
+            float cosLight = -Vec3(faceNormal[0], faceNormal[1], faceNormal[2]).dot(wi);
+            if (cosSurface > 0.0f && cosLight > 0.0f &&
+                world.firstSolid(shadeOrigin, wi, dist - 2e-3f) == AIR) {
+                // Probability densities (per solid angle) of this direction for
+                // the lamp sample and for the diffuse bounce; power heuristic.
+                float lampPdf = dist2 / (cosLight * cell.count * 6.0f);
+                float bouncePdfHere = cosSurface / float(M_PI);
+                float weight = lampPdf * lampPdf / (lampPdf * lampPdf + bouncePdfHere * bouncePdfHere);
+                lampLight = lampEmission(world.getBlock(L.x, L.y, L.z)) * (bouncePdfHere / lampPdf * weight);
+                if (wet) lampLight = lampLight * waterTransmittance(dist);
+            }
+        }
     }
-    
-    // Add volumetric lighting contribution
-    return color + volumetrics;
+
+    // Indirect lighting: one cosine-weighted bounce. With that distribution the
+    // bounce carries the full incoming light, so no fixed ambient term is needed:
+    // the sky, other surfaces and (under water) the water's own glow fill the shadows.
+    Vec3 bounceDir = randomCosineDirection(hitNormal);
+    float cosBounce = std::max(1e-4f, hitNormal.dot(bounceDir));
+    Ray scattered(shadeOrigin, bounceDir);
+    Vec3 indirectLight = trace(scattered, world, depth - 1, wet, false,
+                               g_settings.sampleLamps ? &shadeOrigin : nullptr, cosBounce / float(M_PI));
+
+    // Use the procedurally textured albedo in the final color calculation
+    return finish(albedo * (directLight + lampLight + indirectLight));
 }
 
 // Fixed benchmark: the same views, sample count and random sequences on every
@@ -2421,9 +2685,11 @@ struct BenchView {
 static const BenchView g_benchViews[] = {
     {"lake",       92.5f, 15.3f, 98.2f, 4.19f, -0.20f},
     {"shore",      49.6f, 14.1f, 65.3f, 1.93f, -0.01f},
-    {"underwater", 74.5f,  8.5f, 90.5f, 0.80f,  0.15f},
+    {"underwater", 83.8f, 4.83f, 50.99f, 0.997f, 0.078f},
     {"lakebed",    74.5f, 17.0f, 90.5f, 0.80f, -0.90f},
     {"aerial",     64.0f, 75.0f, 64.0f, 0.60f, -1.20f},
+    {"deep",       66.5f,  5.5f, 52.5f, 1.571f, -0.12f},
+    {"lookup",     65.01f, 8.09f, 59.55f, 4.769f, 0.677f},
 };
 
 int runFixedBenchmark(const World& world, int samples) {
@@ -2506,6 +2772,7 @@ int main(int argc, char* argv[]) {
     bool offlineMode = false;
     bool benchmarkMode = false;
     bool fixedBenchmark = false;
+    bool dumpCaustics = false;
     bool samplesGiven = false;
     std::string demoFile = "demo.json";
     
@@ -2534,6 +2801,14 @@ int main(int argc, char* argv[]) {
             g_settings.enableVolumetrics = false;
         } else if (arg == "--no-lamp-sampling") {
             g_settings.sampleLamps = false;
+        } else if (arg == "--dump-caustics") {
+            dumpCaustics = true;
+        } else if (arg == "--no-particles") {
+            g_settings.enableParticles = false;
+        } else if (arg == "--caustic-strength" && i + 1 < argc) {
+            g_settings.causticStrength = std::max(0.0f, std::stof(argv[++i]));
+        } else if (arg == "--shaft-strength" && i + 1 < argc) {
+            g_settings.shaftStrength = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--time" && i + 1 < argc) {
             g_settings.timeOfDay = std::max(0.0f, std::min(1.0f, std::stof(argv[++i])));
         } else if (arg == "--resolution" && i + 1 < argc) {
@@ -2555,7 +2830,11 @@ int main(int argc, char* argv[]) {
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
                          "  --threads <n>        render threads (default: all)\n"
                          "  --seed <n>           world seed (default 42)\n"
-                         "  --caustic-quality <1-3>  8, 16 or 32 caustic samples (default 3)\n"
+                         "  --caustic-quality <1-3>  caustic map detail: 2, 4 or 8 texels per block (default 2; offline uses 3)\n"
+                         "  --caustic-strength <x>   contrast of the caustic pattern (default 1, 0 = even light)\n"
+                         "  --shaft-strength <x>     brightness of underwater light shafts (default 1)\n"
+                         "  --no-particles           no drifting specks in the water\n"
+                         "  --dump-caustics          write the caustic map's layers to output/ as images and exit\n"
                          "  --time <0-1>         time of day (default 0.85; 0.5 is midday)\n"
                          "  --no-caustics, --no-volumetrics   turn an effect off\n"
                          "  --no-lamp-sampling   find light blocks by bounces only (slower to converge; for comparison)\n";
@@ -2568,6 +2847,30 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    if (dumpCaustics) {
+        // Debug aid: the caustic map's layers as images (white = 3x the light under flat water)
+        World dumpWorld;
+        dumpWorld.generate(g_settings.worldSeed);
+        g_sun.updateFromTimeOfDay(g_settings.timeOfDay);
+        static const int texelsPerBlock[3] = {2, 4, 8};
+        g_caustics.update(dumpWorld, g_sun, 2.0f, texelsPerBlock[g_settings.causticQuality - 1]);
+        std::filesystem::create_directories(g_settings.outputDir);
+        int n = g_caustics.texels();
+        std::vector<uint8_t> rgb(size_t(n) * n * 3);
+        for (int d = 0; d < CausticMap::LAYERS; d++) {
+            const float* layer = g_caustics.layer(d);
+            for (int i = 0; i < n * n; i++) {
+                uint8_t v = uint8_t(std::min(255.0f, std::max(0.0f, layer[i] * 85.0f)));
+                rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+            }
+            std::stringstream ss;
+            ss << g_settings.outputDir << "/caustics_depth_" << std::setfill('0') << std::setw(2) << d << ".png";
+            writePNG(ss.str(), rgb.data(), n, n);
+        }
+        std::cout << "Wrote " << CausticMap::LAYERS << " caustic layers to " << g_settings.outputDir << "/\n";
+        return 0;
+    }
+
     if (fixedBenchmark) {
         World benchWorld;
         benchWorld.generate(g_settings.worldSeed);
@@ -2793,9 +3096,9 @@ int main(int argc, char* argv[]) {
                             g_settings.causticQuality = (g_settings.causticQuality % 3) + 1;
                             std::cout << "Caustic Quality: ";
                             switch(g_settings.causticQuality) {
-                                case 1: std::cout << "Low (8 samples)\n"; break;
-                                case 2: std::cout << "Medium (16 samples)\n"; break;
-                                case 3: std::cout << "High (32 samples)\n"; break;
+                                case 1: std::cout << "Low (2 texels per block)\n"; break;
+                                case 2: std::cout << "Medium (4 texels per block)\n"; break;
+                                case 3: std::cout << "High (8 texels per block)\n"; break;
                             }
                             needsReset = true;
                             break;
