@@ -1,0 +1,8 @@
+{
+  "total_duration": 0.05,
+  "keyframe_count": 2,
+  "keyframes": [
+    { "time": 0.0, "x": 92.5, "y": 15.3, "z": 98.2, "yaw": 4.19, "pitch": -0.2 },
+    { "time": 0.05, "x": 92.3, "y": 15.3, "z": 98.1, "yaw": 4.19, "pitch": -0.2 }
+  ]
+}

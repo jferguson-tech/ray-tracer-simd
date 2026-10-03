@@ -76,7 +76,7 @@ if not exist "%SDL_DIR%\include\SDL2\SDL.h" (
 rem ---- compile
 echo Compiling trace.cpp ...
 if not exist build mkdir build
-cl /nologo /std:c++17 /O2 /arch:AVX2 /EHsc /MD /I"%SDL_DIR%\include" trace.cpp ^
+cl /nologo /std:c++17 /O2 /arch:AVX2 /EHsc /MT /I"%SDL_DIR%\include" trace.cpp ^
    /Fo"build\\" /Fe"pathtracer.exe" ^
    /link /SUBSYSTEM:CONSOLE /LIBPATH:"%SDL_DIR%\lib\x64" SDL2main.lib SDL2.lib shell32.lib
 if errorlevel 1 (
