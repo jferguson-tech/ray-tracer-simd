@@ -105,14 +105,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 1.20 | 173 |
-| shore | 1.19 | 187 |
-| underwater | 1.70 | 121 |
-| lakebed | 1.56 | 182 |
-| aerial | 0.62 | 257 |
-| deep | 1.56 | 127 |
-| lookup | 1.72 | 146 |
-| total | 9.56 | 160 |
+| lake | 0.67 | 310 |
+| shore | 0.86 | 260 |
+| underwater | 0.91 | 228 |
+| lakebed | 0.96 | 295 |
+| aerial | 0.43 | 368 |
+| deep | 1.10 | 181 |
+| lookup | 1.26 | 200 |
+| total | 6.18 | 247 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -165,6 +165,12 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
 - Volumetric shadow rays marched as 8-wide SIMD packets through the voxel DDA
 - Effects run at full quality on what the camera sees (directly or through water) and with
   one random sample on indirect bounces; rays rising above the highest block stop early
+- Sun horizon: once per frame, each row of the world is swept from its far end to find, per
+  column, the height above which a ray toward the sun cannot hit anything. Those cells are
+  flagged in a copy of the grid, so sun shadow rays stop at the first flagged cell instead of
+  marching to the top of the world. The result is exactly what the full march returns
+- Persistent worker threads for render passes, image conversion and the caustic map; the
+  8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
   multiple importance sampling) and one cosine-weighted bounce that gathers sky and surface light
 - Water surface: a sum of eight waves in different directions (5-block swells down to

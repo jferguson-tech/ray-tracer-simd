@@ -12,6 +12,9 @@
 #include <cmath>
 #include <random>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
@@ -768,6 +771,68 @@ struct SunLight {
 // The sun for the frame being rendered (set once per pass by the renderer)
 SunLight g_sun;
 
+// Worker threads that stay alive between jobs. Every render pass, image
+// conversion and caustic map build runs on them; starting two dozen new
+// threads for each of those costs more than a small pass does.
+class WorkerPool {
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    const std::function<void(int)>* job = nullptr;
+    int jobThreads = 0;       // workers 0 .. jobThreads-1 take part in the current job
+    int pending = 0;
+    uint64_t jobId = 0;
+    bool quit = false;
+
+    void workerLoop(int index, uint64_t seenJob) {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            wake.wait(lock, [&] { return quit || jobId != seenJob; });
+            if (quit) return;
+            seenJob = jobId;
+            if (index >= jobThreads) continue;
+            const std::function<void(int)>* fn = job;
+            lock.unlock();
+            (*fn)(index);
+            lock.lock();
+            if (--pending == 0) finished.notify_one();
+        }
+    }
+
+public:
+    // Runs fn(0), fn(1), ... fn(threads - 1), each on its own thread, and waits for all of them
+    void run(int threads, const std::function<void(int)>& fn) {
+        threads = std::max(1, threads);
+        std::unique_lock<std::mutex> lock(mutex);
+        while (static_cast<int>(workers.size()) < threads) {
+            int index = static_cast<int>(workers.size());
+            workers.emplace_back([this, index, seen = jobId] { workerLoop(index, seen); });
+        }
+        job = &fn;
+        jobThreads = threads;
+        pending = threads;
+        jobId++;
+        wake.notify_all();
+        finished.wait(lock, [&] { return pending == 0; });
+        job = nullptr;
+    }
+
+    ~WorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            quit = true;
+        }
+        wake.notify_all();
+        for (auto& w : workers) w.join();
+    }
+};
+
+WorkerPool g_pool;
+
+inline int renderThreadCount() {
+    return g_settings.threads > 0 ? g_settings.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+}
+
 // Random utilities
 // PCG32 (pcg-random.org, minimal variant). Each render thread re-seeds it for
 // every pixel of every pass from (frame, pass, pixel), so an image depends only
@@ -1086,6 +1151,16 @@ class World {
     int topY = WORLD_HEIGHT - 1;      // highest y that holds any block
     std::vector<Vec3i> lights;        // every block that gives off light
     uint64_t generation = 0;          // changes whenever the world is regenerated
+
+    // Sun horizon (see prepareSunShadows): a copy of the grid in which bit 7 of
+    // a cell means "a ray toward the sun passing through here cannot hit any
+    // block". Written by the main thread before the render threads start; they
+    // only read it.
+    static constexpr uint8_t SUN_CLEAR = 0x80;
+    mutable std::vector<uint8_t> sunBlocks;
+    mutable Vec3 sunClearDir;
+    mutable uint64_t sunClearGeneration = 0;
+    mutable bool sunClearValid = false;
     
     float getTerrainHeight(int x, int z) const {
         float height = 12;
@@ -1285,6 +1360,68 @@ public:
 
     uint64_t getGeneration() const { return generation; }
 
+    // Shortcut for shadow rays toward the sun. Most of them pass through dozens
+    // of empty cells to find nothing. For a sun direction that runs along one
+    // horizontal axis (it always does here), sweep each row from its far end:
+    // with `rise` the height a ray gains per column,
+    // clear(x) = max(top(x), clear(next) - rise) is the highest any block further
+    // along reaches when followed back down the ray's slope. A ray in a cell
+    // above that, plus a margin, cannot hit anything, so those cells are flagged
+    // in a copy of the grid and a march toward the sun stops at the first
+    // flagged cell. The margin covers where the ray is inside its cell (up to
+    // one column, so `rise`), a block's own height (1) and one more cell for
+    // rounding in the march (1). The result is exactly what the full march
+    // would have returned.
+    void prepareSunShadows(const Vec3& toSun) const {
+        if (sunClearValid && sunClearGeneration == generation && sunClearDir.x == toSun.x &&
+            sunClearDir.y == toSun.y && sunClearDir.z == toSun.z) {
+            return;
+        }
+        sunClearValid = false;
+        sunClearDir = toSun;
+        sunClearGeneration = generation;
+        bool alongX = toSun.z == 0.0f && toSun.x != 0.0f;
+        bool alongZ = toSun.x == 0.0f && toSun.z != 0.0f;
+        bool vertical = toSun.x == 0.0f && toSun.z == 0.0f;
+        if (!(toSun.y > 1e-3f) || !(alongX || alongZ || vertical)) return;    // no shortcut: rays march as usual
+
+        sunBlocks = blocks;
+        const float rise = vertical ? 0.0f : toSun.y / std::abs(alongX ? toSun.x : toSun.z);
+        const float margin = rise + 2.001f;
+        auto columnTop = [&](int x, int z) {        // highest solid block, -1 if none
+            for (int y = topY; y >= 0; y--) {
+                uint8_t b = blocks[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT];
+                if (b != AIR && b != WATER) return y;
+            }
+            return -1;
+        };
+        for (int line = 0; line < WORLD_SIZE; line++) {
+            float clear = -1e30f;
+            int step = alongX ? (toSun.x > 0 ? 1 : -1) : (toSun.z > 0 ? 1 : -1);
+            // From the far end (in the sun's direction) back toward the near end
+            for (int k = 0; k < WORLD_SIZE; k++) {
+                int i = step > 0 ? WORLD_SIZE - 1 - k : k;
+                int x = alongX ? i : line, z = alongX ? line : i;
+                float top = float(columnTop(x, z));
+                clear = vertical ? top : std::max(top, clear - rise);
+                // Cells whose floor is above clear + margin
+                float limit = clear + margin;
+                int firstClear = limit < 0.0f ? 0 : static_cast<int>(std::floor(limit)) + 1;
+                for (int y = firstClear; y < WORLD_HEIGHT; y++) {
+                    sunBlocks[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT] |= SUN_CLEAR;
+                }
+            }
+        }
+        sunClearValid = true;
+    }
+
+    // The grid to march through for a ray in direction `dir`: the flagged copy
+    // toward the sun, the plain grid otherwise (no cell is flagged there)
+    inline const uint8_t* gridFor(const Vec3& dir) const {
+        bool sunward = sunClearValid && dir.x == sunClearDir.x && dir.y == sunClearDir.y && dir.z == sunClearDir.z;
+        return sunward ? sunBlocks.data() : blocks.data();
+    }
+
     // Is the water surface open above this column? (Outside the world counts
     // as open water, so light also arrives from beyond the edge.)
     bool waterSurfaceAt(int x, int z) const {
@@ -1415,67 +1552,65 @@ public:
         float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
         
         float dist = 0;
-        
+
         BlockType startBlock = getBlock(static_cast<int>(std::floor(ray.origin.x)),
                                         static_cast<int>(std::floor(ray.origin.y)),
                                         static_cast<int>(std::floor(ray.origin.z)));
         bool startedInWater = (startBlock == WATER);
         bool currentlyInWater = startedInWater;
-        
+
+        // The cell is always inside the world here (clamped at the start, and
+        // the loop ends when a step leaves it), so the grid is read directly
+        // and its index moves with the cell.
+        const uint8_t* grid = blocks.data();
+        int idx = x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT;
+        const int idxStepX = stepX, idxStepY = stepY * WORLD_SIZE, idxStepZ = stepZ * WORLD_SIZE * WORLD_HEIGHT;
+        int axis = -1;              // axis of the last step: the face the ray came in through (-1: none yet)
+        auto hit = [&](BlockType block) {
+            hitPos = pos + dir * dist;
+            hitBlock = block;
+            hitNormal = axis == 0 ? Vec3(-stepX, 0, 0) : axis == 1 ? Vec3(0, -stepY, 0)
+                      : axis == 2 ? Vec3(0, 0, -stepZ) : normal;
+            return true;
+        };
+
         while (dist < maxDist) {
-            BlockType block = getBlock(x, y, z);
-            
-            if (currentlyInWater && block == AIR) {
-                hitPos = pos + dir * dist;
-                hitBlock = WATER;
-                hitNormal = normal;
-                return true;
-            } else if (!currentlyInWater && block == WATER) {
-                hitPos = pos + dir * dist;
-                hitBlock = WATER;
-                hitNormal = normal;
-                return true;
-            }
-            
-            if (block != AIR && block != WATER) {
-                hitPos = pos + dir * dist;
-                hitBlock = block;
-                hitNormal = normal;
-                return true;
-            }
-            
-            if (block == WATER) {
-                currentlyInWater = true;
-            } else if (block == AIR) {
-                currentlyInWater = false;
-            }
-            
+            BlockType block = static_cast<BlockType>(grid[idx]);
+
+            // A water surface, crossed from either side
+            if (currentlyInWater ? block == AIR : block == WATER) return hit(WATER);
+            if (block != AIR && block != WATER) return hit(block);
+
             if (tMaxX < tMaxY) {
                 if (tMaxX < tMaxZ) {
                     x += stepX;
+                    idx += idxStepX;
                     dist = tMaxX;
                     tMaxX += tDeltaX;
-                    normal = Vec3(-stepX, 0, 0);
+                    axis = 0;
                 } else {
                     z += stepZ;
+                    idx += idxStepZ;
                     dist = tMaxZ;
                     tMaxZ += tDeltaZ;
-                    normal = Vec3(0, 0, -stepZ);
+                    axis = 2;
                 }
             } else {
                 if (tMaxY < tMaxZ) {
                     y += stepY;
+                    idx += idxStepY;
                     dist = tMaxY;
                     tMaxY += tDeltaY;
-                    normal = Vec3(0, -stepY, 0);
+                    axis = 1;
                 } else {
                     z += stepZ;
+                    idx += idxStepZ;
                     dist = tMaxZ;
                     tMaxZ += tDeltaZ;
-                    normal = Vec3(0, 0, -stepZ);
+                    axis = 2;
                 }
             }
-            
+
             if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) {
                 break;
             }
@@ -1499,6 +1634,7 @@ public:
         int x = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.x))));
         int y = std::min(WORLD_HEIGHT - 1, std::max(0, static_cast<int>(std::floor(pos.y))));
         int z = std::min(WORLD_SIZE - 1, std::max(0, static_cast<int>(std::floor(pos.z))));
+        const uint8_t* grid = gridFor(dir);
 
         int stepX = dir.x > 0 ? 1 : -1;
         int stepY = dir.y > 0 ? 1 : -1;
@@ -1514,8 +1650,9 @@ public:
 
         float dist = 0;
         while (dist < maxDist) {
-            BlockType block = static_cast<BlockType>(blocks[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT]);
-            if (block != AIR && block != WATER) return block;
+            uint8_t block = grid[x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT];
+            if (block & SUN_CLEAR) return AIR;      // toward the sun, above everything in the way
+            if (block != AIR && block != WATER) return static_cast<BlockType>(block);
 
             if (tMaxX < tMaxY && tMaxX < tMaxZ) {
                 x += stepX; dist = tMaxX; tMaxX += tDeltaX;
@@ -1555,14 +1692,13 @@ public:
                         const Vec3& dirIn, float maxDist,
                         const bool laneActive[8], uint8_t outBlock[8]) const {
         Vec3 dir = dirIn.normalize();
-        const uint8_t* bp = blocks.data();
+        const uint8_t* bp = gridFor(dirIn);
         const __m256i widthV = _mm256_set1_epi32(WORLD_SIZE);
         const __m256i heightV = _mm256_set1_epi32(WORLD_HEIGHT);
         const __m256i minusOne = _mm256_set1_epi32(-1);
-        const __m256i strideY = _mm256_set1_epi32(WORLD_SIZE);
-        const __m256i strideZ = _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT);
         const __m256i maxIdx = _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE - 1);
         const __m256i waterV = _mm256_set1_epi32(WATER);
+        const __m256i clearBit = _mm256_set1_epi32(SUN_CLEAR);
 
         F8 pox = F8::load(ox), poy = F8::load(oy), poz = F8::load(oz);
         F8 fx = floor8(pox), fy = floor8(poy), fz = floor8(poz);
@@ -1577,23 +1713,22 @@ public:
         F8 tMaxX = (dir.x != 0) ? (fx + F8(stepX > 0 ? 1.0f : 0.0f) - pox) / F8(dir.x) : F8(1e30f);
         F8 tMaxY = (dir.y != 0) ? (fy + F8(stepY > 0 ? 1.0f : 0.0f) - poy) / F8(dir.y) : F8(1e30f);
         F8 tMaxZ = (dir.z != 0) ? (fz + F8(stepZ > 0 ? 1.0f : 0.0f) - poz) / F8(dir.z) : F8(1e30f);
-        float tDeltaX = (dir.x != 0) ? stepX / dir.x : 1e30f;
-        float tDeltaY = (dir.y != 0) ? stepY / dir.y : 1e30f;
-        float tDeltaZ = (dir.z != 0) ? stepZ / dir.z : 1e30f;
+        const __m256 tDeltaX = _mm256_set1_ps((dir.x != 0) ? stepX / dir.x : 1e30f);
+        const __m256 tDeltaY = _mm256_set1_ps((dir.y != 0) ? stepY / dir.y : 1e30f);
+        const __m256 tDeltaZ = _mm256_set1_ps((dir.z != 0) ? stepZ / dir.z : 1e30f);
+        const __m256 maxDistV = _mm256_set1_ps(maxDist);
+        const __m256i stepXV = _mm256_set1_epi32(stepX), stepYV = _mm256_set1_epi32(stepY), stepZV = _mm256_set1_epi32(stepZ);
+        // The block index moves with the cell, so it is never recomputed from x, y, z
+        const __m256i idxStepX = _mm256_set1_epi32(stepX);
+        const __m256i idxStepY = _mm256_set1_epi32(stepY * WORLD_SIZE);
+        const __m256i idxStepZ = _mm256_set1_epi32(stepZ * WORLD_SIZE * WORLD_HEIGHT);
+        const __m256i topV = _mm256_set1_epi32(topY + 1);
 
         auto inBoundsMask = [&]() {
             __m256i okX = _mm256_and_si256(_mm256_cmpgt_epi32(x, minusOne), _mm256_cmpgt_epi32(widthV, x));
             __m256i okY = _mm256_and_si256(_mm256_cmpgt_epi32(y, minusOne), _mm256_cmpgt_epi32(heightV, y));
             __m256i okZ = _mm256_and_si256(_mm256_cmpgt_epi32(z, minusOne), _mm256_cmpgt_epi32(widthV, z));
             return _mm256_and_si256(okX, _mm256_and_si256(okY, okZ));
-        };
-        auto gatherBlocks = [&](__m256i inBounds) {
-            __m256i idx = _mm256_add_epi32(x, _mm256_add_epi32(_mm256_mullo_epi32(y, strideY),
-                                                               _mm256_mullo_epi32(z, strideZ)));
-            idx = _mm256_max_epi32(_mm256_min_epi32(idx, maxIdx), _mm256_setzero_si256());
-            __m256i raw = _mm256_i32gather_epi32((const int*)bp, idx, 1);
-            __m256i b = _mm256_and_si256(raw, _mm256_set1_epi32(0xFF));
-            return _mm256_and_si256(b, inBounds);   // out-of-bounds reads as AIR, like getBlock()
         };
 
         __m256i active = _mm256_setr_epi32(
@@ -1602,10 +1737,21 @@ public:
         __m256i result = _mm256_setzero_si256();    // AIR = no hit
         for (int i = 0; i < 8; i++) t_rayCount += laneActive[i] ? 1 : 0;
 
+        __m256i idx = _mm256_add_epi32(x, _mm256_add_epi32(_mm256_mullo_epi32(y, _mm256_set1_epi32(WORLD_SIZE)),
+                                                           _mm256_mullo_epi32(z, _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT))));
+        __m256i inBounds = inBoundsMask();          // for the current cells; carried from step to step
+
         for (int guard = 0; guard < 2048; guard++) {
             if (_mm256_movemask_ps(_mm256_castsi256_ps(active)) == 0) break;
 
-            __m256i block = gatherBlocks(inBoundsMask());
+            __m256i safeIdx = _mm256_max_epi32(_mm256_min_epi32(idx, maxIdx), _mm256_setzero_si256());
+            __m256i raw = _mm256_i32gather_epi32((const int*)bp, safeIdx, 1);
+            // Out-of-bounds reads as AIR, like getBlock()
+            __m256i block = _mm256_and_si256(_mm256_and_si256(raw, _mm256_set1_epi32(0xFF)), inBounds);
+            // Toward the sun and above everything in the way: the lane is done, nothing hit
+            __m256i clear = _mm256_cmpeq_epi32(_mm256_and_si256(block, clearBit), clearBit);
+            active = _mm256_andnot_si256(clear, active);
+
             __m256i isAir = _mm256_cmpeq_epi32(block, _mm256_setzero_si256());
             __m256i isWater = _mm256_cmpeq_epi32(block, waterV);
             __m256i isSolid = _mm256_andnot_si256(_mm256_or_si256(isAir, isWater), minusOne);
@@ -1620,22 +1766,25 @@ public:
             __m256 maskX = _mm256_and_ps(ltXY, ltXZ);
             __m256 maskY = _mm256_andnot_ps(ltXY, ltYZ);
             __m256 maskZ = _mm256_andnot_ps(_mm256_or_ps(maskX, maskY), _mm256_castsi256_ps(minusOne));
+            __m256i mX = _mm256_castps_si256(maskX), mY = _mm256_castps_si256(maskY), mZ = _mm256_castps_si256(maskZ);
 
             __m256 dist = _mm256_blendv_ps(tMaxZ.v, tMaxY.v, maskY);
             dist = _mm256_blendv_ps(dist, tMaxX.v, maskX);
 
-            x = _mm256_add_epi32(x, _mm256_and_si256(_mm256_set1_epi32(stepX), _mm256_castps_si256(maskX)));
-            y = _mm256_add_epi32(y, _mm256_and_si256(_mm256_set1_epi32(stepY), _mm256_castps_si256(maskY)));
-            z = _mm256_add_epi32(z, _mm256_and_si256(_mm256_set1_epi32(stepZ), _mm256_castps_si256(maskZ)));
-            tMaxX = F8(_mm256_blendv_ps(tMaxX.v, _mm256_add_ps(tMaxX.v, _mm256_set1_ps(tDeltaX)), maskX));
-            tMaxY = F8(_mm256_blendv_ps(tMaxY.v, _mm256_add_ps(tMaxY.v, _mm256_set1_ps(tDeltaY)), maskY));
-            tMaxZ = F8(_mm256_blendv_ps(tMaxZ.v, _mm256_add_ps(tMaxZ.v, _mm256_set1_ps(tDeltaZ)), maskZ));
+            x = _mm256_add_epi32(x, _mm256_and_si256(stepXV, mX));
+            y = _mm256_add_epi32(y, _mm256_and_si256(stepYV, mY));
+            z = _mm256_add_epi32(z, _mm256_and_si256(stepZV, mZ));
+            idx = _mm256_add_epi32(idx, _mm256_or_si256(_mm256_and_si256(idxStepX, mX),
+                                        _mm256_or_si256(_mm256_and_si256(idxStepY, mY), _mm256_and_si256(idxStepZ, mZ))));
+            tMaxX = F8(_mm256_blendv_ps(tMaxX.v, _mm256_add_ps(tMaxX.v, tDeltaX), maskX));
+            tMaxY = F8(_mm256_blendv_ps(tMaxY.v, _mm256_add_ps(tMaxY.v, tDeltaY), maskY));
+            tMaxZ = F8(_mm256_blendv_ps(tMaxZ.v, _mm256_add_ps(tMaxZ.v, tDeltaZ), maskZ));
 
-            __m256 distOk = _mm256_cmp_ps(dist, _mm256_set1_ps(maxDist), _CMP_LT_OQ);
-            active = _mm256_and_si256(active, _mm256_castps_si256(distOk));
-            active = _mm256_and_si256(active, inBoundsMask());
+            active = _mm256_and_si256(active, _mm256_castps_si256(_mm256_cmp_ps(dist, maxDistV, _CMP_LT_OQ)));
+            inBounds = inBoundsMask();
+            active = _mm256_and_si256(active, inBounds);
             // Rising above every block: open sky, the lane is done
-            if (stepY > 0) active = _mm256_and_si256(active, _mm256_cmpgt_epi32(_mm256_set1_epi32(topY + 1), y));
+            if (stepY > 0) active = _mm256_and_si256(active, _mm256_cmpgt_epi32(topV, y));
         }
 
         alignas(32) int res[8];
@@ -1851,7 +2000,7 @@ public:
         const float cosFlat = std::max(1e-3f, -incident.y);
         const float flatFlux = cosFlat * (1.0f - (0.02f + 0.98f * std::pow(1.0f - cosFlat, 5.0f)));
 
-        int threads = g_settings.threads > 0 ? g_settings.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+        int threads = renderThreadCount();
 
         // 1. Refract every photon through the surface: where it lands per block
         //    of depth, and how much light it carries relative to flat water.
@@ -1965,16 +2114,15 @@ private:
     uint64_t builtWorld = 0;
     Vec3 builtSun;
 
+    // Splits 0 .. count-1 into one contiguous range per thread
     template <typename Fn>
     static void runParallel(int count, int threads, Fn fn) {
         threads = std::max(1, std::min(threads, count));
-        std::vector<std::thread> pool;
-        for (int t = 0; t < threads; t++) {
+        g_pool.run(threads, [&](int t) {
             int begin = int(int64_t(count) * t / threads);
             int end = int(int64_t(count) * (t + 1) / threads);
-            pool.emplace_back([=]() { fn(begin, end); });
-        }
-        for (auto& th : pool) th.join();
+            fn(begin, end);
+        });
     }
 
     // Separable Gaussian blur of one layer (sigma in texels)
@@ -2051,11 +2199,6 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     // Water is murkier than air, so its shafts are sampled over a shorter stretch
     float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
 
-    float cosTheta = ray.direction.dot(inWater ? -sun.refracted : -sun.direction);
-    // Water scatters less sharply forward than haze, so shafts also show from the side
-    float g = inWater ? 0.5f : 0.6f;
-    float phase = (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
-
     // Jittered sample positions along the ray (SoA, padded to 2 groups of 8)
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
     bool laneActive[16];
@@ -2071,7 +2214,8 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
                                             static_cast<int>(std::floor(samplePos.z))) == WATER);
         laneActive[i] = (sampleInWater == inWater);
     }
-    for (int i = evaluated; i < 16; i++) {
+    const int groups = (evaluated + 7) / 8;
+    for (int i = evaluated; i < groups * 8; i++) {      // pad the last group of 8
         ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
         laneActive[i] = false;
     }
@@ -2079,7 +2223,7 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     // How much sun reaches each sample: 1, 0.3 through leaves, 0 behind solid blocks
     Vec3 toSun = -sun.direction;
     alignas(32) float visible[16];
-    const int groups = (evaluated + 7) / 8;
+    bool anyVisible = false;
     for (int group = 0; group < groups; group++) {
         int base = group * 8;
         uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -2093,19 +2237,44 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         for (int L = 0; L < 8; L++) {
             uint8_t hb = hitBlock[L];
             visible[base + L] = !laneActive[base + L] ? 0.0f : hb == AIR ? 1.0f : hb == LEAVES ? 0.3f : 0.0f;
+            anyVisible = anyVisible || visible[base + L] > 0.0f;
         }
     }
+    // No sample sees the sun: every term below would be multiplied by zero
+    if (!anyVisible) return Vec3(0, 0, 0);
     const float scaleUp = float(numSamples) / float(evaluated);
+
+    float cosTheta = ray.direction.dot(inWater ? -sun.refracted : -sun.direction);
+    // Water scatters less sharply forward than haze, so shafts also show from the side
+    float g = inWater ? 0.5f : 0.6f;
+    float phase = (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
 
     if (inWater) {
         const float invDown = 1.0f / std::max(0.05f, -sun.refracted.y);
+        // Sun to each sample (slanted path down), then sample to the eye: the
+        // light that survives, per color.
         Vec3 sum(0, 0, 0);
-        for (int i = 0; i < evaluated; i++) {
-            if (visible[i] <= 0.0f) continue;
-            float depth = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
-            float light = visible[i] * causticAt(sx[i], sz[i], depth);
-            // Sun to the sample (slanted path down), then sample to the eye
-            sum += waterTransmittance(depth * invDown + ts[i]) * light;
+        if (evaluated == 1) {
+            float depth = std::max(0.0f, float(WATER_LEVEL) - sy[0]);
+            float light = visible[0] * causticAt(sx[0], sz[0], depth);
+            sum += waterTransmittance(depth * invDown + ts[0]) * light;
+        } else {
+            // All samples go through exp8 together, one color at a time
+            alignas(32) float tr[3][16];
+            float depths[16];
+            for (int i = 0; i < groups * 8; i++) {
+                depths[i] = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
+                float path = visible[i] > 0.0f ? depths[i] * invDown + ts[i] : 0.0f;
+                for (int c = 0; c < 3; c++) tr[c][i] = -WATER_EXTINCTION[c] * path;
+            }
+            for (int c = 0; c < 3; c++) {
+                for (int group = 0; group < groups; group++) exp8(F8::load(tr[c] + group * 8)).store(tr[c] + group * 8);
+            }
+            for (int i = 0; i < evaluated; i++) {
+                if (visible[i] <= 0.0f) continue;
+                float light = visible[i] * causticAt(sx[i], sz[i], depths[i]);
+                sum += Vec3(tr[0][i], tr[1][i], tr[2][i]) * light;
+            }
         }
         return sun.getLightContribution() * sum *
                (scaleUp * sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize *
@@ -2288,6 +2457,7 @@ class Renderer {
     std::atomic<int> nextTile;
     std::atomic<uint64_t> rayCount{0};
     uint64_t frameSeed = 0;
+    bool framebufferStale = true;     // the accumulator has passes the framebuffer does not show yet
     int sampleCount;
     int currentWidth, currentHeight;
     static constexpr int TILE_SIZE = 8;
@@ -2329,46 +2499,48 @@ public:
 
         // Per-pass state shared by all render threads
         g_sun.updateFromTimeOfDay(g_settings.timeOfDay);
+        world.prepareSunShadows(g_sun.direction * -1.0f);
         if (g_settings.enableCaustics) {
             static const int texelsPerBlock[3] = {2, 4, 8};
             int quality = g_settings.mode == Settings::MODE_OFFLINE_RENDER ? 3 : g_settings.causticQuality;
             g_caustics.update(world, g_sun, g_settings.waterAnimation, texelsPerBlock[quality - 1]);
         }
 
-        int numThreads = g_settings.threads > 0 ? g_settings.threads
-                                                : std::max(1u, std::thread::hardware_concurrency());
-        std::vector<std::thread> threads;
-        
         bool cameraUnderwater = getCameraUnderwater(camera, world);
-        
-        for (int i = 0; i < numThreads; i++) {
-            threads.emplace_back([this, &camera, &world, cameraUnderwater]() {
-                renderThread(camera, world, cameraUnderwater);
-            });
-        }
-        
-        for (auto& t : threads) {
-            t.join();
-        }
-        
-        // Convert accumulator to framebuffer
-        for (int i = 0; i < currentWidth * currentHeight; i++) {
-            Vec3 color = accumulator[i] / float(sampleCount * SAMPLES_PER_PIXEL);
-            
-            color.x = color.x / (1.0f + color.x);
-            color.y = color.y / (1.0f + color.y);
-            color.z = color.z / (1.0f + color.z);
-            
-            color.x = std::pow(color.x, 1.0f / 2.2f);
-            color.y = std::pow(color.y, 1.0f / 2.2f);
-            color.z = std::pow(color.z, 1.0f / 2.2f);
-            
-            uint8_t r = static_cast<uint8_t>(std::min(color.x * 255.0f, 255.0f));
-            uint8_t g = static_cast<uint8_t>(std::min(color.y * 255.0f, 255.0f));
-            uint8_t b = static_cast<uint8_t>(std::min(color.z * 255.0f, 255.0f));
-            
-            framebuffer[i] = (r << 16) | (g << 8) | b;
-        }
+
+        g_pool.run(renderThreadCount(), [&](int) { renderThread(camera, world, cameraUnderwater); });
+        framebufferStale = true;
+    }
+
+    // Convert accumulator to framebuffer: tone mapping and gamma, per pixel.
+    // Done only when the image is shown or saved (offline rendering and the
+    // benchmark need it once per image, not once per pass), on all threads.
+    void resolveFramebuffer() {
+        if (!framebufferStale) return;
+        framebufferStale = false;
+        const int total = currentWidth * currentHeight;
+        const int threads = std::max(1, std::min(renderThreadCount(), total / 4096));
+        g_pool.run(threads, [&](int t) {
+            int begin = int(int64_t(total) * t / threads);
+            int end = int(int64_t(total) * (t + 1) / threads);
+            for (int i = begin; i < end; i++) {
+                Vec3 color = accumulator[i] / float(sampleCount * SAMPLES_PER_PIXEL);
+
+                color.x = color.x / (1.0f + color.x);
+                color.y = color.y / (1.0f + color.y);
+                color.z = color.z / (1.0f + color.z);
+
+                color.x = std::pow(color.x, 1.0f / 2.2f);
+                color.y = std::pow(color.y, 1.0f / 2.2f);
+                color.z = std::pow(color.z, 1.0f / 2.2f);
+
+                uint8_t r = static_cast<uint8_t>(std::min(color.x * 255.0f, 255.0f));
+                uint8_t g = static_cast<uint8_t>(std::min(color.y * 255.0f, 255.0f));
+                uint8_t b = static_cast<uint8_t>(std::min(color.z * 255.0f, 255.0f));
+
+                framebuffer[i] = (r << 16) | (g << 8) | b;
+            }
+        });
     }
     
     // Selects the random sequence for the following passes. With the same seed,
@@ -2417,12 +2589,16 @@ public:
         rayCount += t_rayCount;
     }
     
-    const uint32_t* getFramebuffer() const { return framebuffer.data(); }
+    const uint32_t* getFramebuffer() {
+        resolveFramebuffer();
+        return framebuffer.data();
+    }
     int getSampleCount() const { return sampleCount * SAMPLES_PER_PIXEL; }
     int getWidth() const { return currentWidth; }
     int getHeight() const { return currentHeight; }
     
     bool saveFrame(const std::string& filename) {
+        resolveFramebuffer();
         std::vector<uint8_t> rgb(size_t(currentWidth) * currentHeight * 3);
         for (int i = 0; i < currentWidth * currentHeight; i++) {
             uint32_t pixel = framebuffer[i];
@@ -2696,7 +2872,7 @@ int runFixedBenchmark(const World& world, int samples) {
     Renderer renderer;
     Camera camera;
     SystemInfo sys = SystemInfo::get();
-    int threads = g_settings.threads > 0 ? g_settings.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+    int threads = renderThreadCount();
     std::filesystem::create_directories(g_settings.outputDir);
 
     std::cout << "Fixed benchmark: " << g_settings.renderWidth << "x" << g_settings.renderHeight
