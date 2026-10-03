@@ -84,6 +84,18 @@ speed.)
 ./pathtracer --bench --samples 128 --resolution 5 # 720p, 128 samples per pixel
 ```
 
+Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
+(16C/32T, MSVC /O2 /arch:AVX2):
+
+| View | Time (s) | Mrays/s |
+|---|---|---|
+| lake | 1.16 | 180 |
+| shore | 1.15 | 195 |
+| underwater | 0.98 | 169 |
+| lakebed | 1.48 | 192 |
+| aerial | 0.56 | 281 |
+| total | 5.33 | 195 |
+
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
 a change against a previous build, keep the old images and compare:
@@ -133,6 +145,8 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
 - Custom Vec3 backed by SSE registers; 8-wide AVX2 sin/cos/exp kernels (no FMA required)
 - Caustics sampling, volumetric scattering and value-noise textures vectorized 8-wide
 - Volumetric shadow rays marched as 8-wide SIMD packets through the voxel DDA
+- Effects run at full quality on what the camera sees (directly or through water) and with
+  one random sample on indirect bounces; rays rising above the highest block stop early
 - Voxel grid traversal (3D DDA); rays that start outside the world are clipped to it
 - Stratified sampling of the water surface for caustics
 

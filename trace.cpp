@@ -1013,6 +1013,7 @@ inline Vec3 getStoneTexture(const Vec3& pos, const Vec3& normal) {
 class World {
     std::vector<uint8_t> blocks;
     int seed;
+    int topY = WORLD_HEIGHT - 1;      // highest y that holds any block
     
     float getTerrainHeight(int x, int z) const {
         float height = 12;
@@ -1153,6 +1154,12 @@ public:
         }
         
         generateWaterBodies(11);
+
+        topY = 0;
+        for (int z = 0; z < WORLD_SIZE; z++)
+            for (int y = 0; y < WORLD_HEIGHT; y++)
+                for (int x = 0; x < WORLD_SIZE; x++)
+                    if (getBlock(x, y, z) != AIR) topY = std::max(topY, y);
     }
     
     inline BlockType getBlock(int x, int y, int z) const {
@@ -1291,6 +1298,7 @@ public:
             if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) {
                 break;
             }
+            if (stepY > 0 && y > topY) break;       // rising above every block: open sky
         }
 
         return false;
@@ -1336,8 +1344,22 @@ public:
                 z += stepZ; dist = tMaxZ; tMaxZ += tDeltaZ;
             }
             if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) break;
+            if (stepY > 0 && y > topY) break;       // rising above every block: open sky
         }
         return false;
+    }
+
+    // First block a shadow ray hits, with the same rules as raycastShadow8 for
+    // one ray: WATER means it crossed a water surface, AIR that nothing was hit.
+    uint8_t shadowBlock(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        if (origin.x < 0 || origin.x >= WORLD_SIZE || origin.y < 0 || origin.y >= WORLD_HEIGHT ||
+            origin.z < 0 || origin.z >= WORLD_SIZE) {
+            return AIR;                             // the packet version does not enter from outside
+        }
+        Vec3 hitPos, hitNormal;
+        BlockType block;
+        raycast(Ray(origin, dir), maxDist, hitPos, hitNormal, block);
+        return block;
     }
 
     // 8-wide shadow raycast: 8 origins, one shared direction (volumetric shadow
@@ -1436,6 +1458,8 @@ public:
             __m256 distOk = _mm256_cmp_ps(dist, _mm256_set1_ps(maxDist), _CMP_LT_OQ);
             active = _mm256_and_si256(active, _mm256_castps_si256(distOk));
             active = _mm256_and_si256(active, inBoundsMask());
+            // Rising above every block: open sky, the lane is done
+            if (stepY > 0) active = _mm256_and_si256(active, _mm256_cmpgt_epi32(_mm256_set1_epi32(topY + 1), y));
         }
 
         alignas(32) int res[8];
@@ -1593,10 +1617,18 @@ Vec3 getSkyColor(const Vec3& direction, float timeOfDay, const SunLight& sun) {
 // runs 8-wide. One behavior fix vs the scalar original: when a shadow ray hit
 // nothing, the old code read an uninitialized hitBlock (UB); a miss is now a
 // defined "sun fully visible".
-Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater) {
+//
+// fullQuality marches all 12 steps (rays the camera sees directly or through
+// water). Otherwise one randomly chosen step is evaluated and scaled by 12: the
+// average is the same, at a twelfth of the work, and the extra noise lands on
+// indirect light where it is not visible.
+Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater,
+                          bool fullQuality) {
     if (!g_settings.enableVolumetrics) return Vec3(0, 0, 0);
 
     const int numSamples = 12;
+    const int evaluated = fullQuality ? numSamples : 1;
+    const int firstStep = fullQuality ? 0 : std::min(numSamples - 1, int(random01() * numSamples));
     float stepSize = std::min(maxDist, 50.0f) / float(numSamples);
 
     float scatteringCoeff = inWater ? 0.2f : 0.04f;
@@ -1609,8 +1641,8 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     // Jittered sample positions along the ray (SoA, padded to 2 groups of 8)
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
     bool laneActive[16];
-    for (int i = 0; i < numSamples; i++) {
-        float t = stepSize * (i + random01() * 0.5f);
+    for (int i = 0; i < evaluated; i++) {
+        float t = stepSize * (firstStep + i + random01() * 0.5f);
         Vec3 samplePos = ray.at(t);
         ts[i] = t;
         sx[i] = samplePos.x;
@@ -1621,18 +1653,24 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
                                             static_cast<int>(std::floor(samplePos.z))) == WATER);
         laneActive[i] = (sampleInWater == inWater);
     }
-    for (int i = numSamples; i < 16; i++) {
+    for (int i = evaluated; i < 16; i++) {
         ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
         laneActive[i] = false;
     }
 
     Vec3 toSun = -sun.direction;
     float total = 0.0f;
-    for (int group = 0; group < 2; group++) {
+    const int groups = (evaluated + 7) / 8;
+    for (int group = 0; group < groups; group++) {
         int base = group * 8;
-        uint8_t hitBlock[8];
-        world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
-                             laneActive + base, hitBlock);
+        uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (evaluated == 1) {
+            // A packet with one live lane costs almost a full packet; use a plain ray.
+            if (laneActive[0]) hitBlock[0] = world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, 100.0f);
+        } else {
+            world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
+                                 laneActive + base, hitBlock);
+        }
 
         alignas(32) float lane[8];
         for (int L = 0; L < 8; L++) {
@@ -1663,6 +1701,7 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         F8 absorption = exp8(F8::load(ts + base) * F8(-absorptionCoeff));
         total += hsum8(li * att * absorption);
     }
+    total *= float(numSamples) / float(evaluated);
 
     Vec3 volumetricLight = sun.color * (total * scatteringCoeff * phase * stepSize);
 
@@ -1677,7 +1716,9 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
 }
 
 // Physically-based caustics calculation
-float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun, float time) {
+// fullQuality uses the configured sample count (surfaces the camera sees);
+// otherwise 8 samples, which is enough for light that only arrives indirectly.
+float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun, float time, bool fullQuality) {
     if (!g_settings.enableCaustics) return 0.0f;
     
     // Early exit if above water
@@ -1711,6 +1752,9 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
     // For offline rendering, always use high quality
     if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
         samples = 32;
+    }
+    if (!fullQuality) {
+        samples = 8;
     }
     
     // Sample area size - smaller = sharper caustics
@@ -1790,8 +1834,11 @@ float calculateCaustics(const Vec3& pos, const World& world, const SunLight& sun
 }
 
 // Path tracing (simplified for space, same as original)
+// cameraPath: the ray comes from the camera, directly or through water
+// refraction/reflection (not after a diffuse bounce). Effects run at full quality on it.
 // hitDistOut (optional) receives the distance this ray travelled to its first hit.
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, float* hitDistOut = nullptr);
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater = false, bool cameraPath = false,
+           float* hitDistOut = nullptr);
 
 // Minimal PNG writer: 8-bit RGB, stored (uncompressed) deflate blocks.
 // No external library; any viewer or video tool reads the result.
@@ -1985,7 +2032,7 @@ public:
                         float v = -(y + random01() - currentHeight/2.0f) / (currentHeight/2.0f);
                         
                         Ray ray = camera.getRay(u, v, aspectRatio);
-                        color = color + trace(ray, world, MAX_BOUNCES, cameraUnderwater);
+                        color = color + trace(ray, world, MAX_BOUNCES, cameraUnderwater, true);
                     }
                     
                     int idx = y * currentWidth + x;
@@ -2014,7 +2061,7 @@ public:
 };
 
 // Complete trace function implementation
-Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, float* hitDistOut) {
+Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath, float* hitDistOut) {
     if (hitDistOut) *hitDistOut = 0.0f;
     if (depth <= 0) return Vec3(0, 0, 0);
     
@@ -2035,7 +2082,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
     // Calculate volumetric lighting along the ray
     Vec3 volumetrics(0, 0, 0);
     if (g_settings.enableVolumetrics) {
-        volumetrics = calculateVolumetrics(ray, hitDistance, world, sun, insideWater);
+        volumetrics = calculateVolumetrics(ray, hitDistance, world, sun, insideWater, cameraPath);
     }
     
     if (!didHit) {
@@ -2087,7 +2134,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
         
         bool rayNowInsideWater = entering && !totalInternalReflection;
         float waterDistance = 0.0f;                 // how far the refracted ray travels in the water
-        Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, &waterDistance);
+        Vec3 transmitted = trace(refractedRay, world, depth - 1, rayNowInsideWater, cameraPath, &waterDistance);
         
         // Water absorption with tropical blue tint
         if (entering && !totalInternalReflection) {
@@ -2108,7 +2155,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
             if (reflectance > 0.02f) {
                 Vec3 reflectedDir = ray.direction - normal * 2.0f * ray.direction.dot(normal);
                 Ray reflectedRay(hitPos + normal * 0.01f, reflectedDir);
-                Vec3 reflected = trace(reflectedRay, world, depth - 1, false);
+                Vec3 reflected = trace(reflectedRay, world, depth - 1, false, cameraPath);
                 
                 // Mix in water color even with reflections
                 Vec3 waterColor(0.1f, 0.35f, 0.45f);
@@ -2190,7 +2237,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
         
         // Add physically-based caustics
         if (isUnderwater) {
-            float caustics = calculateCaustics(hitPos, world, sun, g_settings.waterAnimation);
+            float caustics = calculateCaustics(hitPos, world, sun, g_settings.waterAnimation, cameraPath);
             
             // Add chromatic aberration to caustics for realism
             Vec3 causticsColor;
@@ -2206,7 +2253,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, floa
         Ray scattered(hitPos + hitNormal * 0.01f, (target - hitPos).normalize());
         
         float ambientStrength = isUnderwater ? 0.2f : (0.3f + 0.2f * sun.intensity);
-        Vec3 indirectLight = trace(scattered, world, depth - 1, isUnderwater) * ambientStrength;
+        Vec3 indirectLight = trace(scattered, world, depth - 1, isUnderwater, false) * ambientStrength;
         
         // Ambient term
         Vec3 ambient = isUnderwater ? 
