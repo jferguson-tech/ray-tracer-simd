@@ -90,6 +90,7 @@ echo.
 echo Built pathtracer.exe
 echo   pathtracer.exe                       interactive viewer
 echo   pathtracer.exe --play                play demo.json in the window
+echo   pathtracer.exe --bench                fixed benchmark: timings and images
 echo   pathtracer.exe --offline --samples 64 --resolution 3    render demo.json to output\
 echo   pathtracer.exe --help                all options
 

@@ -44,5 +44,8 @@
 build/
 third_party/
 output/
+output_*/
 pathtracer
 benchmark_results.json
+benchmark_fixed.json
+_env/

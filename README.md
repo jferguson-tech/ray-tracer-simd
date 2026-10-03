@@ -13,6 +13,7 @@ High-performance C++ path tracer with SIMD acceleration.
 - Voxel world with procedurally textured terrain, refractive and reflective water, and emissive light blocks
 - Sun and sky lighting, water caustics and volumetric light shafts
 - Camera path recording, playback, benchmarking and offline rendering (JSON)
+- Repeatable renders: the same command produces the same image, on any number of threads
 
 ## Performance
 
@@ -49,8 +50,9 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 ```bash
 ./pathtracer                         # interactive viewer
 ./pathtracer demo.json --play        # play a recorded camera path in the window
-./pathtracer --benchmark             # play demo.json and write benchmark_results.json
-./pathtracer --offline --samples 128 --resolution 5   # render demo.json to output/frame_NNNNN.ppm
+./pathtracer --bench                 # fixed benchmark: five views, timings and images
+./pathtracer --benchmark             # play demo.json in real time and write benchmark_results.json
+./pathtracer --offline --samples 128 --resolution 5   # render demo.json to output/frame_NNNNN.png
 ./pathtracer --help
 ```
 
@@ -58,11 +60,37 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 |---|---|
 | `demo.json` or `--demo <file>` | Camera path file to load (default `demo.json`). This is a camera path, not a scene: the world is generated from a seed. |
 | `--play` | Play the camera path in the window |
-| `--benchmark` | Play the camera path and write `benchmark_results.json` |
-| `--offline` | Render the camera path to `output/` at 30 frames per second, without a window |
-| `--samples <n>` | Samples per pixel for each offline frame (default 1000) |
+| `--bench` | Fixed benchmark (see below), without a window |
+| `--benchmark` | Play the camera path in real time and write `benchmark_results.json` |
+| `--offline` | Render the camera path to `output/` as PNG at 30 frames per second, without a window |
+| `--samples <n>` | Samples per pixel: offline frames (default 1000), `--bench` (default 32) |
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
+| `--threads <n>` | Render threads (default: all) |
+| `--seed <n>` | World seed (default 42) |
 | `--caustic-quality <1-3>` | 8, 16 or 32 caustic samples (default 3) |
+| `--no-caustics`, `--no-volumetrics` | Turn an effect off |
+
+### Fixed benchmark
+`--bench` renders five fixed views (lake, shore, underwater, lake bed, aerial) at
+a fixed sample count and prints the time, rays per second and samples per second
+for each. It writes the images to `output/bench_<view>.png` and the numbers to
+`benchmark_fixed.json`. The views, sample count and random sequences are the same
+on every machine, so results compare across builds and computers. (`--benchmark`
+plays a camera path in real time, so what it renders depends on the machine's
+speed.)
+
+```bash
+./pathtracer --bench                              # 360p, 32 samples per pixel
+./pathtracer --bench --samples 128 --resolution 5 # 720p, 128 samples per pixel
+```
+
+Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
+the same command gives a byte-identical image on any number of threads. To check
+a change against a previous build, keep the old images and compare:
+
+```bash
+python compare_images.py output_before output      # PSNR and difference per view
+```
 
 ### Controls (interactive)
 | Keys | Action |
@@ -96,9 +124,10 @@ python create_video.py --fps 60
 # Use specific number of CPU cores
 python create_video.py -w 8
 
-# Benchmark PPM readers
+# Benchmark PPM readers (frames from older builds)
 python create_video.py --benchmark
 ```
+Offline frames are PNG; the script also reads the PPM frames older builds wrote.
 
 ## Technical Highlights
 - Custom Vec3 backed by SSE registers; 8-wide AVX2 sin/cos/exp kernels (no FMA required)
@@ -109,8 +138,8 @@ python create_video.py --benchmark
 
 ## Requirements
 ```bash
-# For video generation
-pip install opencv-python numpy
+# For video generation and compare_images.py
+pip install -r requirements.txt
 ```
 
 
