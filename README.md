@@ -105,14 +105,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.67 | 310 |
-| shore | 0.86 | 260 |
-| underwater | 0.91 | 228 |
-| lakebed | 0.96 | 295 |
-| aerial | 0.43 | 368 |
-| deep | 1.10 | 181 |
-| lookup | 1.26 | 200 |
-| total | 6.18 | 247 |
+| lake | 0.61 | 339 |
+| shore | 0.80 | 279 |
+| underwater | 0.89 | 233 |
+| lakebed | 0.91 | 312 |
+| aerial | 0.39 | 406 |
+| deep | 1.05 | 190 |
+| lookup | 1.20 | 209 |
+| total | 5.85 | 262 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check

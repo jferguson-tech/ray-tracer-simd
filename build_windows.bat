@@ -45,7 +45,7 @@ rem ---- SDL2: download and unpack once
 if not exist "%SDL_DIR%\lib\x64\SDL2.lib" (
     if not exist third_party mkdir third_party
     echo Downloading SDL2 %SDL_VER% ...
-    curl.exe -L --fail --silent --show-error -o "%SDL_ZIP%" "%SDL_URL%"
+    curl.exe -L --fail --silent --show-error --retry 5 --retry-delay 5 -o "%SDL_ZIP%" "%SDL_URL%"
     if errorlevel 1 (
         echo ERROR: could not download %SDL_URL%
         exit /b 1
@@ -60,7 +60,8 @@ if not exist "%SDL_DIR%\lib\x64\SDL2.lib" (
         del "%SDL_ZIP%"
         exit /b 1
     )
-    tar.exe -xf "%SDL_ZIP%" -C third_party
+    rem The tar that ships with Windows reads zip files; a different tar earlier on the PATH may not
+    "%SystemRoot%\System32\tar.exe" -xf "%SDL_ZIP%" -C third_party
     if errorlevel 1 (
         echo ERROR: could not unpack %SDL_ZIP%
         exit /b 1
