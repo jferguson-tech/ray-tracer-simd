@@ -26,6 +26,13 @@ jobs:
           ./pathtracer --offline --demo tests/smoke.json --samples 4 --resolution 1
           cmp output_first/frame_00000.png output/frame_00000.png
           cmp output_first/frame_00001.png output/frame_00001.png
+      - name: Continue from frame 1 and check it matches the full render
+        shell: bash
+        run: |
+          rm -rf output
+          ./pathtracer --offline --demo tests/smoke.json --samples 4 --resolution 1 --start-frame 1
+          test ! -e output/frame_00000.png
+          cmp output_first/frame_00001.png output/frame_00001.png
       - name: Fixed benchmark
         run: ./pathtracer --bench --samples 2 --resolution 1
 
@@ -49,6 +56,13 @@ jobs:
           mv output output_first
           ./pathtracer.exe --offline --demo tests/smoke.json --samples 4 --resolution 1
           cmp output_first/frame_00000.png output/frame_00000.png
+          cmp output_first/frame_00001.png output/frame_00001.png
+      - name: Continue from frame 1 and check it matches the full render
+        shell: bash
+        run: |
+          rm -rf output
+          ./pathtracer.exe --offline --demo tests/smoke.json --samples 4 --resolution 1 --start-frame 1
+          test ! -e output/frame_00000.png
           cmp output_first/frame_00001.png output/frame_00001.png
       - name: Fixed benchmark
         shell: bash

@@ -3014,6 +3014,7 @@ int main(int argc, char* argv[]) {
     bool fixedBenchmark = false;
     bool dumpCaustics = false;
     bool samplesGiven = false;
+    int startFrame = 0;
     std::string demoFile = "demo.json";
     
     for (int i = 1; i < argc; i++) {
@@ -3031,6 +3032,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--samples" && i + 1 < argc) {
             g_settings.offlineTargetSamples = std::max(1, std::stoi(argv[++i]));
             samplesGiven = true;
+        } else if (arg == "--start-frame" && i + 1 < argc) {
+            startFrame = std::max(0, std::stoi(argv[++i]));
         } else if (arg == "--threads" && i + 1 < argc) {
             g_settings.threads = std::max(0, std::stoi(argv[++i]));
         } else if (arg == "--seed" && i + 1 < argc) {
@@ -3066,6 +3069,7 @@ int main(int argc, char* argv[]) {
                          "  --benchmark          play the camera path and write benchmark_results.json\n"
                          "  --bench              render fixed views, print timings, write benchmark_fixed.json (no window)\n"
                          "  --offline            render the camera path to output/frame_NNNNN.png (no window)\n"
+                         "  --start-frame <n>    with --offline: begin at frame n, to continue a render that was stopped\n"
                          "  --samples <n>        samples per pixel: offline frames (default 1000), --bench (default 32)\n"
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
                          "  --threads <n>        render threads (default: all)\n"
@@ -3207,7 +3211,10 @@ int main(int argc, char* argv[]) {
         std::filesystem::create_directories(g_settings.outputDir);
     }
 
-    int offlineFrameCount = 0;
+    // Offline frames depend only on their number (camera, water and random
+    // sequences all follow from it), so a render can begin at any frame and
+    // give the same images as one that ran from the start.
+    int offlineFrameCount = startFrame;
     uint64_t renderedFrames = 0;
     
     while (running) {
@@ -3423,7 +3430,7 @@ int main(int argc, char* argv[]) {
                     std::cout << "Benchmark complete. Results saved to benchmark_results.json\n";
                     g_settings.mode = Settings::MODE_INTERACTIVE;
                 } else if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
-                    std::cout << "Offline render complete. " << offlineFrameCount << " frames saved.\n";
+                    std::cout << "Offline render complete. " << (offlineFrameCount - startFrame) << " frames saved.\n";
                     running = false;
                 } else {
                     demoTime = 0; // Loop demo
