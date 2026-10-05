@@ -6,7 +6,7 @@ High-performance C++ path tracer with SIMD acceleration.
 
 ![A dive through the lake: the camera descends from above the water past coral, kelp and glowing sea lanterns under a network of caustic light, looks up at the sun through the surface, and climbs back out](pathtracer.webp)
 
-*The scripted dive `demo_underwater.json`, rendered offline at 640x360 with 96
+*The scripted dive `demo_underwater.json`, rendered offline at 1280x720 with 256
 samples per pixel and shown at 30 fps. [pathtracer.mp4](pathtracer.mp4) is the
 same clip as a video file.*
 
