@@ -63,6 +63,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 ./pathtracer --bench                 # fixed benchmark: five views, timings and images
 ./pathtracer --benchmark             # play demo.json in real time and write benchmark_results.json
 ./pathtracer --offline --samples 128 --resolution 5   # render demo.json to output/frame_NNNNN.png
+./pathtracer --offline --start-frame 250              # continue a stopped render at frame 250
 ./pathtracer --help
 ```
 
@@ -73,6 +74,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--bench` | Fixed benchmark (see below), without a window |
 | `--benchmark` | Play the camera path in real time and write `benchmark_results.json` |
 | `--offline` | Render the camera path to `output/` as PNG at 30 frames per second, without a window |
+| `--start-frame <n>` | With `--offline`: begin at frame `n` instead of 0, to continue a render that was stopped |
 | `--samples <n>` | Samples per pixel: offline frames (default 1000), `--bench` (default 32) |
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
 | `--threads <n>` | Render threads (default: all) |
