@@ -87,6 +87,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--shaft-strength <x>` | Brightness of underwater light shafts (default 1) |
 | `--no-particles` | No drifting specks in the water |
 | `--denoise`, `--no-denoise` | Denoiser on or off (default: on in the window, off for `--offline`, `--bench` and `--benchmark`) |
+| `--temporal`, `--no-temporal` | The denoiser also reuses the previous view's samples (default: on in the window). With `--offline --denoise`, a frame then depends on the frames rendered before it |
 | `--dump-caustics` | Write the caustic map's layers to `output/` as images and exit |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
 | `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
@@ -142,6 +143,19 @@ PSNR of the seven `--bench` views against a 1024 samples per pixel reference
 | 8 | 28.9 - 38.4 dB | 32.0 - 43.0 dB |
 | 32 | 34.9 - 44.2 dB | 36.6 - 47.0 dB |
 
+While the camera moves, the denoiser also reuses the previous view (`H` toggles
+it, `--temporal` turns it on for `--offline --denoise`): each pixel's surface
+point is looked up in the previous image and, where the same surface was
+visible there, its light is mixed in before the filter runs. Measured on frames
+of `demo_underwater.json` at 640x360, 2 samples per pixel, against 512 samples
+per pixel:
+
+| Frame | As rendered | Denoised | Denoised, with the previous view |
+|---|---|---|---|
+| 24 (above the lake) | 24.5 dB | 30.1 dB | 33.0 dB |
+| 314 (on the lake bed) | 25.3 dB | 33.6 dB | 35.4 dB |
+| 614 (looking up at the surface) | 32.1 dB | 36.9 dB | 37.0 dB |
+
 The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 7950X (32 threads).
 
@@ -158,6 +172,7 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 | `F5` / `F6` | Save / load the path |
 | Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic map detail |
 | `N` | Toggle the denoiser |
+| `H` | Toggle the denoiser's reuse of the previous view |
 | `Esc` | Quit |
 
 The water animates while the view is changing and holds still while a still
@@ -218,6 +233,11 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   the light is filtered; neighbors count less when they are off the pixel's surface plane,
   face another way, or differ in brightness by more than the variance of the pixel's own
   samples explains
+- Temporal reuse: when the view changes, each pixel's surface point is projected into the
+  previous camera and the light stored there is mixed in if it shows the same surface (same
+  face, on its plane; through water, the apparent position along the camera ray is compared).
+  The previous view counts for at most 4 samples, because haze and the water's glow depend
+  on the viewpoint; the water surface seen from below is not reused
 - Trees, lights and lake decoration (rocks, coral, kelp, sea lanterns) are placed by an integer
   hash of the column, so they are the same on every platform and at any world size; sea
   lanterns are light blocks and are sampled directly

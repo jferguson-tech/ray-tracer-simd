@@ -452,6 +452,7 @@ struct Settings {
     bool sampleLamps = true;          // sample light blocks directly (off: found by bounces only)
     bool enableParticles = true;      // drifting specks in the water
     bool denoise = false;             // filter the image along surfaces before it is shown or saved
+    bool temporal = false;            // the denoiser also reuses the previous view's samples
     float causticStrength = 1.0f;     // contrast of the caustic pattern (0 = even light)
     float shaftStrength = 1.0f;       // brightness of underwater light shafts
     int causticQuality = 2;  // caustic map detail: 1=low (2 texels per block), 2=medium (4), 3=high (8)
@@ -2498,22 +2499,33 @@ struct PixelSurface {
     Vec3 albedo{1.0f, 1.0f, 1.0f};
     Vec3 normal;
     Vec3 position;
+    // Where the surface appears to be: straight along the camera ray, at the
+    // length of the whole path. The same as `position` unless the path went
+    // through water. Used to find the pixel again from another viewpoint.
+    Vec3 viewPosition;
+    bool viaWater = false;            // seen through or mirrored in a water surface
     bool found = false;               // false: sky, or open water with nothing behind it
 };
 
 PixelSurface findPixelSurface(Ray ray, const World& world, bool insideWater) {
     PixelSurface out;
+    const Vec3 eye = ray.origin, view = ray.direction;
+    out.viewPosition = eye + view * 10000.0f;       // sky: far away along the ray
+    float travelled = 0.0f;
     for (int segment = 0; segment < 4; segment++) {
         Vec3 hitPos, hitNormal;
         BlockType hitBlock;
         if (!world.raycast(ray, MAX_RAY_DISTANCE, hitPos, hitNormal, hitBlock)) return out;
+        travelled += (hitPos - ray.origin).length();
         if (hitBlock != WATER) {
             out.albedo = isEmitter(hitBlock) ? Vec3(1.0f, 1.0f, 1.0f) : surfaceAlbedo(hitBlock, hitPos, hitNormal);
             out.normal = hitNormal;
             out.position = hitPos;
+            out.viewPosition = eye + view * travelled;
             out.found = true;
             return out;
         }
+        out.viaWater = true;
         // The water surface, with the same waves and Fresnel terms as trace()
         bool fromAbove = !insideWater;
         Vec3 normal = hitNormal;
@@ -2636,6 +2648,20 @@ class Renderer {
     std::vector<Vec3> filterColor[2];
     std::vector<float> filterVariance[2];
     Vec3 cameraPosition;              // of the pass being accumulated
+    Camera::RayBasis viewBasis;       // ... and its camera rays
+    // Temporal reuse. `blended*` is this view's light per pixel before the
+    // spatial filter, with the previous view's mixed in; `history*` is the
+    // same for the previous view, with its surfaces and camera.
+    std::vector<Vec3> blendedLight, historyLight;
+    std::vector<float> blendedSquares, historySquares, blendedCount, historyCount;
+    std::vector<PixelSurface> historySurfaces;
+    Camera::RayBasis historyBasis;
+    bool blendedValid = false, historyValid = false;
+    bool viewUnderwater = false, historyUnderwater = false;
+    // The most weight the previous view can carry, in samples. Kept small: the
+    // haze and the water's glow depend on the viewpoint, so a long memory
+    // lags visibly behind a moving camera.
+    static constexpr float HISTORY_SAMPLES = 4.0f;
     std::atomic<int> nextTile;
     std::atomic<uint64_t> rayCount{0};
     uint64_t frameSeed = 0;
@@ -2664,11 +2690,25 @@ public:
             accumulator.resize(width * height);
             surfaces.clear();
             brightnessSquares.clear();
-            reset();
+            reset();                  // the previous view has another size: its samples cannot be reused
         }
     }
     
-    void reset() {
+    // Starts a new accumulation. keepHistory: the scene is the same and only
+    // the view changed, so the denoiser may reuse the view that ends here.
+    void reset(bool keepHistory = false) {
+        if (!keepHistory) {
+            historyValid = false;
+        } else if (blendedValid) {
+            historyLight.swap(blendedLight);
+            historySquares.swap(blendedSquares);
+            historyCount.swap(blendedCount);
+            historySurfaces.swap(surfaces);
+            historyBasis = viewBasis;
+            historyUnderwater = viewUnderwater;
+            historyValid = true;
+        }
+        blendedValid = false;
         sampleCount = 0;
         std::fill(accumulator.begin(), accumulator.end(), Vec3(0, 0, 0));
         std::fill(brightnessSquares.begin(), brightnessSquares.end(), 0.0f);
@@ -2677,7 +2717,7 @@ public:
     
     void render(const Camera& camera, const World& world, bool cameraMoving) {
         if (cameraMoving) {
-            reset();
+            reset(true);
         }
         
         nextTile = 0;
@@ -2694,6 +2734,8 @@ public:
 
         bool cameraUnderwater = getCameraUnderwater(camera, world);
         cameraPosition = camera.position;
+        viewBasis = camera.rayBasis(float(currentWidth) / currentHeight);
+        viewUnderwater = cameraUnderwater;
 
         // The denoiser's buffers follow the accumulation: they start with its
         // first pass. Turned on later, it waits for the next reset.
@@ -2776,19 +2818,42 @@ public:
             g_pool.run(threads, [&](int t) { fn(h * t / threads, h * (t + 1) / threads); });
         };
 
-        // Light per pixel (color / surface color) and the variance of its mean
+        // Light per pixel (color / surface color) and the variance of its mean.
+        // With temporal reuse, the previous view's light for the same surface
+        // point is mixed in first, weighted by its sample count (capped, so a
+        // moving view keeps following the light): more samples per pixel
+        // before the spatial filter starts.
+        blendedLight.resize(total);
+        blendedSquares.resize(total);
+        blendedCount.resize(total);
+        const bool reuse = g_settings.temporal && historyValid && historySurfaces.size() == total &&
+                           historyLight.size() == total;
         rows([&](int y0, int y1) {
             for (size_t i = size_t(y0) * w; i < size_t(y1) * w; i++) {
                 const Vec3& a = surfaces[i].albedo;
                 Vec3 mean = accumulator[i] / samples;
                 Vec3 light(mean.x / std::max(a.x, ALBEDO_FLOOR), mean.y / std::max(a.y, ALBEDO_FLOOR),
                            mean.z / std::max(a.z, ALBEDO_FLOOR));
+                float squares = brightnessSquares[i] / samples;
+                float count = samples;
+                Vec3 oldLight;
+                float oldSquares, oldCount;
+                if (reuse && fetchHistory(surfaces[i], oldLight, oldSquares, oldCount)) {
+                    oldCount = std::min(oldCount, HISTORY_SAMPLES);
+                    count = samples + oldCount;
+                    light = (light * samples + oldLight * oldCount) / count;
+                    squares = (squares * samples + oldSquares * oldCount) / count;
+                }
+                blendedLight[i] = light;
+                blendedSquares[i] = squares;
+                blendedCount[i] = count;
                 float l = brightness(light);
-                float spread = std::max(0.0f, brightnessSquares[i] / samples - l * l);
+                float spread = std::max(0.0f, squares - l * l);
                 filterColor[0][i] = light;
-                filterVariance[0][i] = spread / std::max(1.0f, samples - 1.0f);
+                filterVariance[0][i] = spread / std::max(1.0f, count - 1.0f);
             }
         });
+        blendedValid = true;
 
         static const float kernel[3] = {3.0f / 8.0f, 1.0f / 4.0f, 1.0f / 16.0f};
         int src = 0;
@@ -2861,6 +2926,55 @@ public:
                                    light.z * std::max(a.z, ALBEDO_FLOOR));
             }
         });
+    }
+
+    // The previous view's light for the surface point a pixel shows: the point
+    // is projected into the previous camera and read from the four pixels
+    // around it, skipping any that showed something else then (another face,
+    // a point off this surface, sky against ground). False if none is left.
+    // Seen from under water, the surface's mirror and window to the sky move
+    // with every wave, so those pixels are not reused.
+    bool fetchHistory(const PixelSurface& p, Vec3& light, float& squares, float& count) const {
+        const int w = currentWidth, h = currentHeight;
+        if (p.viaWater && (viewUnderwater || historyUnderwater)) return false;
+        Vec3 d = p.viewPosition - historyBasis.position;
+        float depth = d.dot(historyBasis.forward);
+        if (depth < 1e-3f) return false;
+        float fx = d.dot(historyBasis.right) / (depth * historyBasis.halfWidth) * (w * 0.5f) + w * 0.5f - 0.5f;
+        float fy = -d.dot(historyBasis.up) / (depth * historyBasis.halfHeight) * (h * 0.5f) + h * 0.5f - 0.5f;
+        if (!(fx > -1.0f && fx < float(w) && fy > -1.0f && fy < float(h))) return false;
+        int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
+        float tx = fx - x0, ty = fy - y0;
+        float distance = (p.viewPosition - cameraPosition).length();
+        // Through water the apparent position moves with the waves: a looser match
+        float tolerance = p.viaWater ? 0.3f + 0.03f * distance : 0.1f + 0.01f * distance;
+
+        Vec3 sumLight(0, 0, 0);
+        float sumSquares = 0.0f, sumCount = 0.0f, weightSum = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            int qx = x0 + (k & 1), qy = y0 + (k >> 1);
+            if (qx < 0 || qx >= w || qy < 0 || qy >= h) continue;
+            float weight = ((k & 1) ? tx : 1.0f - tx) * ((k >> 1) ? ty : 1.0f - ty);
+            if (weight <= 0.0f) continue;
+            size_t j = size_t(qy) * w + qx;
+            const PixelSurface& q = historySurfaces[j];
+            if (q.found != p.found) continue;
+            if (p.found) {
+                if (q.viaWater != p.viaWater || p.normal.dot(q.normal) < 0.9f) continue;
+                Vec3 offset = q.viewPosition - p.viewPosition;
+                float miss = p.viaWater ? offset.length() : std::abs(p.normal.dot(offset));
+                if (miss > tolerance) continue;
+            }
+            sumLight += historyLight[j] * weight;
+            sumSquares += historySquares[j] * weight;
+            sumCount += historyCount[j] * weight;
+            weightSum += weight;
+        }
+        if (weightSum < 0.05f) return false;
+        light = sumLight / weightSum;
+        squares = sumSquares / weightSum;
+        count = sumCount / weightSum;
+        return true;
     }
 
     void renderThread(const Camera& camera, const World& world, bool cameraUnderwater, bool gather) {
@@ -3251,6 +3365,7 @@ int main(int argc, char* argv[]) {
     bool dumpCaustics = false;
     bool samplesGiven = false;
     bool denoiseGiven = false;
+    bool temporalGiven = false;
     int startFrame = 0;
     std::string demoFile = "demo.json";
     
@@ -3291,6 +3406,12 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--no-denoise") {
             g_settings.denoise = false;
             denoiseGiven = true;
+        } else if (arg == "--temporal") {
+            g_settings.temporal = true;
+            temporalGiven = true;
+        } else if (arg == "--no-temporal") {
+            g_settings.temporal = false;
+            temporalGiven = true;
         } else if (arg == "--caustic-strength" && i + 1 < argc) {
             g_settings.causticStrength = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--shaft-strength" && i + 1 < argc) {
@@ -3323,6 +3444,9 @@ int main(int argc, char* argv[]) {
                          "  --no-particles           no drifting specks in the water\n"
                          "  --denoise, --no-denoise  filter noise along surfaces (default: on in the window, off for\n"
                          "                           --offline, --bench and --benchmark)\n"
+                         "  --temporal, --no-temporal  the denoiser also reuses the previous view's samples (default:\n"
+                         "                           on in the window). With --offline --denoise, a frame then\n"
+                         "                           depends on the frames rendered before it\n"
                          "  --dump-caustics          write the caustic map's layers to output/ as images and exit\n"
                          "  --time <0-1>         time of day (default 0.85; 0.5 is midday)\n"
                          "  --no-caustics, --no-volumetrics   turn an effect off\n"
@@ -3370,6 +3494,7 @@ int main(int argc, char* argv[]) {
     // The window shows a few samples per pixel, so it is denoised unless told
     // otherwise. Files and timings stay as rendered unless --denoise is given.
     if (!denoiseGiven) g_settings.denoise = !offlineMode && !benchmarkMode;
+    if (!temporalGiven) g_settings.temporal = !offlineMode && !benchmarkMode;
 
     // Offline rendering needs no window, so it also runs on machines without a display.
     if (!offlineMode && SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -3454,7 +3579,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
     std::cout << "KP1: Toggle Caustics | KP2: Toggle Volumetrics\n";
-    std::cout << "KP3: Caustic Quality (Low/Med/High) | N: Toggle Denoiser\n\n";
+    std::cout << "KP3: Caustic Quality (Low/Med/High) | N: Toggle Denoiser | H: Its Reuse Of The Previous View\n\n";
     
     // Create output directory for offline rendering
     if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
@@ -3595,6 +3720,12 @@ int main(int argc, char* argv[]) {
                             needsReset = true;
                             break;
                         
+                        case SDLK_h:
+                            g_settings.temporal = !g_settings.temporal;
+                            std::cout << "Denoiser reuses the previous view: " << (g_settings.temporal ? "ON" : "OFF") << "\n";
+                            needsReset = true;
+                            break;
+                        
                         case SDLK_KP_3:
                             g_settings.causticQuality = (g_settings.causticQuality % 3) + 1;
                             std::cout << "Caustic Quality: ";
@@ -3729,7 +3860,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "Saved frame " << offlineFrameCount << " (samples: " 
                          << renderer.getSampleCount() << ")\n";
                 offlineFrameCount++;
-                renderer.reset();
+                renderer.reset(true);     // the next frame is another view of the same scene
             }
         }
         
