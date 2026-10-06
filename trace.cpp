@@ -23,9 +23,7 @@
 #include <iomanip>
 #include <cstring>
 #include <queue>
-#include <set>
 #include <string>
-#include <tuple>
 #include <immintrin.h>
 #include <SDL2/SDL.h>
 #include <fstream>
@@ -496,12 +494,12 @@ struct Settings {
 Settings g_settings;
 
 // Constants
-constexpr int WORLD_SIZE = 128;
+constexpr int WORLD_SIZE = 512;
 constexpr int WORLD_HEIGHT = 48;
 constexpr int MAX_BOUNCES = 5;
 constexpr int SAMPLES_PER_PIXEL = 2;
 constexpr float FOV = 90.0f;
-constexpr float MAX_RAY_DISTANCE = 500.0f;
+constexpr float MAX_RAY_DISTANCE = 800.0f;     // longer than the world's diagonal
 constexpr float WATER_ANIM_SPEED = 1.5f;   // water animation units per second
 constexpr int WATER_LEVEL = 11;            // water fills the blocks below this height; its surface is at y = WATER_LEVEL
 constexpr float WATER_IOR = 1.333f;
@@ -1171,7 +1169,7 @@ class World {
     
     void generateWaterBodies(int waterLevel) {
         std::queue<Vec3i> waterQueue;
-        std::set<std::tuple<int,int,int>> visited;
+        std::vector<uint8_t> visited(blocks.size(), 0);
         
         for (int x = 0; x < WORLD_SIZE; x++) {
             for (int z = 0; z < WORLD_SIZE; z++) {
@@ -1196,13 +1194,13 @@ class World {
             Vec3i pos = waterQueue.front();
             waterQueue.pop();
             
-            auto key = std::make_tuple(pos.x, pos.y, pos.z);
-            if (visited.count(key)) continue;
-            visited.insert(key);
-            
             if (pos.x < 0 || pos.x >= WORLD_SIZE || 
                 pos.y < 0 || pos.y >= WORLD_HEIGHT || 
                 pos.z < 0 || pos.z >= WORLD_SIZE) continue;
+            
+            uint8_t& seen = visited[pos.x + pos.y * WORLD_SIZE + pos.z * WORLD_SIZE * WORLD_HEIGHT];
+            if (seen) continue;
+            seen = 1;
             
             if (getBlock(pos.x, pos.y, pos.z) == AIR) {
                 setBlock(pos.x, pos.y, pos.z, WATER);
@@ -1295,8 +1293,9 @@ public:
     void generate(int newSeed) {
         seed = newSeed;
         std::fill(blocks.begin(), blocks.end(), AIR);
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        // Trees and lights are placed by an integer hash of the column, so they
+        // are the same on every platform and do not move when the world grows.
+        const uint32_t salt = 0x7f4a7c15U + uint32_t(seed) * 2654435761U;
         
         // Generate terrain
         for (int x = 0; x < WORLD_SIZE; x++) {
@@ -1313,13 +1312,14 @@ public:
                 }
                 
                 // Trees
-                if (dist(rng) < 0.03f && h > 12 && h < WORLD_HEIGHT - 8) {
-                    int treeHeight = 4 + static_cast<int>(dist(rng) * 4);
+                const uint32_t column = hashCell(x, 0, z, salt);
+                if (hashFloat(column) < 0.03f && h > 12 && h < WORLD_HEIGHT - 8) {
+                    int treeHeight = 4 + static_cast<int>(hashFloat(hash32(column + 1)) * 4);
                     for (int y = h; y < h + treeHeight; y++) {
                         setBlock(x, y, z, WOOD);
                     }
                     
-                    int leafRadius = 2 + (dist(rng) > 0.5f ? 1 : 0);
+                    int leafRadius = 2 + (hashFloat(hash32(column + 2)) > 0.5f ? 1 : 0);
                     for (int dx = -leafRadius; dx <= leafRadius; dx++) {
                         for (int dy = treeHeight - 2; dy <= treeHeight + 2; dy++) {
                             for (int dz = -leafRadius; dz <= leafRadius; dz++) {
@@ -1328,7 +1328,7 @@ public:
                                     if (nx >= 0 && nx < WORLD_SIZE && 
                                         nz >= 0 && nz < WORLD_SIZE && 
                                         ny < WORLD_HEIGHT) {
-                                        if (getBlock(nx, ny, nz) == AIR && dist(rng) > 0.2f) {
+                                        if (getBlock(nx, ny, nz) == AIR && hashFloat(hashCell(nx, ny, nz, column)) > 0.2f) {
                                             setBlock(nx, ny, nz, LEAVES);
                                         }
                                     }
@@ -1339,7 +1339,7 @@ public:
                 }
                 
                 // Lights
-                if (dist(rng) < 0.008f && h > 15 && h < WORLD_HEIGHT - 1) {
+                if (hashFloat(hash32(column + 3)) < 0.008f && h > 15 && h < WORLD_HEIGHT - 1) {
                     setBlock(x, h, z, LIGHT);
                 }
             }
@@ -2015,23 +2015,36 @@ inline Vec3 waterGlow(float y, const SunLight& sun) {
 // collected in a stack of horizontal layers, one per block of depth. A value
 // of 1 means "as much light as under flat water"; focused lines are above 1.
 // Lookups are then a few texture reads, with no noise, at any depth.
+//
+// The map covers a square of WINDOW blocks around the camera, so its cost does
+// not grow with the world. The pattern is at full strength out to FADE_START
+// blocks from the camera and fades to even light at FADE_END.
 // ============================================================
 class CausticMap {
 public:
-    static constexpr int MARGIN = 12;                 // blocks of surface simulated beyond the world edge
+    static constexpr int WINDOW = 160;                // blocks per side
+    static constexpr int MARGIN = 12;                 // blocks of surface simulated beyond the window's edge
+    static constexpr float FADE_START = 56.0f;
+    static constexpr float FADE_END = 72.0f;
     static constexpr int LAYERS = WATER_LEVEL + 1;    // depths 0 .. WATER_LEVEL
 
     bool ready() const { return !data.empty(); }
     int texels() const { return size; }
     const float* layer(int d) const { return &data[size_t(d) * size * size]; }
 
-    void update(const World& world, const SunLight& sun, float time, int texelsPerBlock) {
+    void update(const World& world, const SunLight& sun, float time, int texelsPerBlock, const Vec3& center) {
         if (ready() && res == texelsPerBlock && time == builtTime && world.getGeneration() == builtWorld &&
-            sun.direction.x == builtSun.x && sun.direction.y == builtSun.y && sun.direction.z == builtSun.z) {
+            sun.direction.x == builtSun.x && sun.direction.y == builtSun.y && sun.direction.z == builtSun.z &&
+            center.x == centerX && center.z == centerZ) {
             return;
         }
         res = texelsPerBlock;
-        size = WORLD_SIZE * res;
+        size = WINDOW * res;
+        centerX = center.x;
+        centerZ = center.z;
+        // The window starts on a whole block, so texels always line up with the blocks
+        originX = static_cast<int>(std::floor(centerX)) - WINDOW / 2;
+        originZ = static_cast<int>(std::floor(centerZ)) - WINDOW / 2;
         builtTime = time;
         builtWorld = world.getGeneration();
         builtSun = sun.direction;
@@ -2040,7 +2053,7 @@ public:
         // Photons: a grid over the surface, 2 x 2 per texel
         const int perTexel = 2;
         const float spacing = 1.0f / float(res * perTexel);
-        const int np = (WORLD_SIZE + 2 * MARGIN) * res * perTexel;        // per side; a multiple of 8
+        const int np = (WINDOW + 2 * MARGIN) * res * perTexel;            // per side; a multiple of 8
         offX.resize(size_t(np) * np);
         offZ.resize(size_t(np) * np);
         weight.resize(size_t(np) * np);
@@ -2057,12 +2070,12 @@ public:
         auto refractRows = [&](int j0, int j1) {
             alignas(32) float wxs[8], mask[8], ox[8], oz[8], wg[8];
             for (int j = j0; j < j1; j++) {
-                float wz = -float(MARGIN) + (j + 0.5f) * spacing;
+                float wz = float(originZ) + (-float(MARGIN) + (j + 0.5f) * spacing);
                 int bz = static_cast<int>(std::floor(wz));
                 for (int i = 0; i < np; i += 8) {
                     bool any = false;
                     for (int k = 0; k < 8; k++) {
-                        wxs[k] = -float(MARGIN) + (i + k + 0.5f) * spacing;
+                        wxs[k] = float(originX) + (-float(MARGIN) + (i + k + 0.5f) * spacing);
                         bool water = world.waterSurfaceAt(static_cast<int>(std::floor(wxs[k])), bz);
                         mask[k] = water ? 1.0f : 0.0f;
                         any = any || water;
@@ -2101,6 +2114,7 @@ public:
         runParallel(np, threads, refractRows);
 
         // 2. One layer per depth: drop each photon where it lands, then soften.
+        //    (Positions here are relative to the window's corner.)
         auto buildLayers = [&](int d0, int d1) {
             std::vector<float> tmp(size_t(size) * size);
             for (int d = d0; d < d1; d++) {
@@ -2141,6 +2155,27 @@ public:
 
     // Light at (x, z) and a depth below the surface, relative to flat water
     float sample(float x, float z, float depth) const {
+        float dx = x - centerX, dz = z - centerZ;
+        float dist2 = dx * dx + dz * dz;
+        if (dist2 >= FADE_END * FADE_END) return 1.0f;
+        float value = lookup(x - float(originX), z - float(originZ), depth);
+        if (dist2 <= FADE_START * FADE_START) return value;
+        float keep = (FADE_END - std::sqrt(dist2)) / (FADE_END - FADE_START);
+        return 1.0f + (value - 1.0f) * keep;
+    }
+
+private:
+    int res = 0, size = 0;
+    int originX = 0, originZ = 0;            // the window's corner, in blocks
+    float centerX = 0.0f, centerZ = 0.0f;    // the camera the window was built around
+    std::vector<float> data;                 // LAYERS x size x size
+    std::vector<float> offX, offZ, weight;   // photons
+    float builtTime = 0.0f;
+    uint64_t builtWorld = 0;
+    Vec3 builtSun;
+
+    // The map at a position relative to the window's corner
+    float lookup(float x, float z, float depth) const {
         float fd = std::min(float(LAYERS - 1), std::max(0.0f, depth));
         int d0 = std::min(LAYERS - 2, static_cast<int>(fd));
         float td = fd - d0;
@@ -2155,14 +2190,6 @@ public:
         float lb = (b[0] * (1 - tx) + b[1] * tx) * (1 - tz) + (b[size] * (1 - tx) + b[size + 1] * tx) * tz;
         return la * (1 - td) + lb * td;
     }
-
-private:
-    int res = 0, size = 0;
-    std::vector<float> data;                 // LAYERS x size x size
-    std::vector<float> offX, offZ, weight;   // photons
-    float builtTime = 0.0f;
-    uint64_t builtWorld = 0;
-    Vec3 builtSun;
 
     // Splits 0 .. count-1 into one contiguous range per thread
     template <typename Fn>
@@ -2566,7 +2593,7 @@ public:
         if (g_settings.enableCaustics) {
             static const int texelsPerBlock[3] = {2, 4, 8};
             int quality = g_settings.mode == Settings::MODE_OFFLINE_RENDER ? 3 : g_settings.causticQuality;
-            g_caustics.update(world, g_sun, g_settings.waterAnimation, texelsPerBlock[quality - 1]);
+            g_caustics.update(world, g_sun, g_settings.waterAnimation, texelsPerBlock[quality - 1], camera.position);
         }
 
         bool cameraUnderwater = getCameraUnderwater(camera, world);
@@ -3092,12 +3119,13 @@ int main(int argc, char* argv[]) {
     }
     
     if (dumpCaustics) {
-        // Debug aid: the caustic map's layers as images (white = 3x the light under flat water)
+        // Debug aid: the caustic map's layers around the middle of the world as images
+        // (white = 3x the light under flat water)
         World dumpWorld;
         dumpWorld.generate(g_settings.worldSeed);
         g_sun.updateFromTimeOfDay(g_settings.timeOfDay);
         static const int texelsPerBlock[3] = {2, 4, 8};
-        g_caustics.update(dumpWorld, g_sun, 2.0f, texelsPerBlock[g_settings.causticQuality - 1]);
+        g_caustics.update(dumpWorld, g_sun, 2.0f, texelsPerBlock[g_settings.causticQuality - 1], Camera().position);
         std::filesystem::create_directories(g_settings.outputDir);
         int n = g_caustics.texels();
         std::vector<uint8_t> rgb(size_t(n) * n * 3);

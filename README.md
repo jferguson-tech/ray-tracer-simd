@@ -14,7 +14,7 @@ same clip as a video file.*
 - AVX2 SIMD acceleration: measured 1.9-2.2x whole-frame speedup (3-5x in the vectorized subsystems)
 - 8-wide packet ray marching for volumetric shadow rays, vectorized caustic-map and noise kernels, SSE-backed Vec3
 - Multi-threaded tile renderer (std::thread)
-- Voxel world with procedurally textured terrain, refractive and reflective water, and emissive light blocks
+- 512 x 512 block voxel world with procedurally textured terrain, refractive and reflective water, and emissive light blocks
 - Sun and sky lighting and volumetric light shafts, above and below the water
 - Underwater: a caustic light network that reaches the lake bed at any depth, water that turns
   from turquoise to blue with depth and distance, light shafts, drifting particles, and the sky
@@ -60,7 +60,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 ./pathtracer                         # interactive viewer
 ./pathtracer demo.json --play        # play a recorded camera path in the window
 ./pathtracer demo_underwater.json --play   # a scripted dive through the central lake
-./pathtracer --bench                 # fixed benchmark: five views, timings and images
+./pathtracer --bench                 # fixed benchmark: seven views, timings and images
 ./pathtracer --benchmark             # play demo.json in real time and write benchmark_results.json
 ./pathtracer --offline --samples 128 --resolution 5   # render demo.json to output/frame_NNNNN.png
 ./pathtracer --offline --start-frame 250              # continue a stopped render at frame 250
@@ -103,18 +103,18 @@ speed.)
 ```
 
 Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
-(16C/32T, MSVC /O2 /arch:AVX2):
+(16C/32T, Linux, g++ 13.3 -O3 -mavx2):
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.61 | 339 |
-| shore | 0.80 | 279 |
-| underwater | 0.89 | 233 |
-| lakebed | 0.91 | 312 |
-| aerial | 0.39 | 406 |
-| deep | 1.05 | 190 |
-| lookup | 1.20 | 209 |
-| total | 5.85 | 262 |
+| lake | 0.51 | 411 |
+| shore | 0.71 | 317 |
+| underwater | 0.73 | 284 |
+| lakebed | 0.70 | 406 |
+| aerial | 0.49 | 424 |
+| deep | 0.85 | 232 |
+| lookup | 0.99 | 253 |
+| total | 4.98 | 318 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -180,7 +180,9 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   and chosen by probability on indirect paths; from below, total internal reflection leaves a
   window to the sky surrounded by a mirror of the lake bed
 - Caustic map: once per frame, a grid of light samples is refracted through the waves and
-  collected in one layer per block of depth (built on all threads). Any
+  collected in one layer per block of depth (built on all threads). It covers the 160 blocks
+  around the camera, so its cost does not depend on the size of the world; the pattern fades
+  to even light between 56 and 72 blocks away. Any
   underwater point then reads its light with a few texture lookups: no noise, at any depth,
   with slight color fringes because blue bends more than red. `--dump-caustics` shows the layers
 - Water as a medium: every ray segment in water loses light per color (red first) and gains
@@ -188,8 +190,9 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   shafts and drifting particles are lit through the caustic map, and blocks in or above the
   water cast shadows into it. Sunlight under water is shown about three times brighter than
   it physically is (an artistic gain, as if the eye had adapted)
-- Lake decoration (rocks, coral, kelp, sea lanterns) is placed by an integer hash, so it is
-  the same on every platform; sea lanterns are light blocks and are sampled directly
+- Trees, lights and lake decoration (rocks, coral, kelp, sea lanterns) are placed by an integer
+  hash of the column, so they are the same on every platform and at any world size; sea
+  lanterns are light blocks and are sampled directly
 - Voxel grid traversal (3D DDA); rays that start outside the world are clipped to it
 
 ## Requirements
