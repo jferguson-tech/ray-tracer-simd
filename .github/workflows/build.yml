@@ -35,6 +35,8 @@ jobs:
           cmp output_first/frame_00001.png output/frame_00001.png
       - name: Fixed benchmark
         run: ./pathtracer --bench --samples 2 --resolution 1
+      - name: Fixed benchmark, denoised
+        run: ./pathtracer --bench --samples 2 --resolution 1 --denoise
 
   windows:
     runs-on: windows-latest
@@ -67,3 +69,6 @@ jobs:
       - name: Fixed benchmark
         shell: bash
         run: ./pathtracer.exe --bench --samples 2 --resolution 1
+      - name: Fixed benchmark, denoised
+        shell: bash
+        run: ./pathtracer.exe --bench --samples 2 --resolution 1 --denoise

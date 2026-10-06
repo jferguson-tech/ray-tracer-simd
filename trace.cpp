@@ -451,6 +451,7 @@ struct Settings {
     bool enableVolumetrics = true;
     bool sampleLamps = true;          // sample light blocks directly (off: found by bounces only)
     bool enableParticles = true;      // drifting specks in the water
+    bool denoise = false;             // filter the image along surfaces before it is shown or saved
     float causticStrength = 1.0f;     // contrast of the caustic pattern (0 = even light)
     float shaftStrength = 1.0f;       // brightness of underwater light shafts
     int causticQuality = 2;  // caustic map detail: 1=low (2 texels per block), 2=medium (4), 3=high (8)
@@ -2465,6 +2466,88 @@ inline Vec3 lampEmission(BlockType block) {
     return g_materials[block].emission;
 }
 
+// Surface color of a block at a point: its procedural texture, or the plain
+// material color for blocks without one
+inline Vec3 surfaceAlbedo(BlockType block, const Vec3& pos, const Vec3& normal) {
+    const MaterialProps& mat = g_materials[block];
+    switch(block) {
+        case DIRT:
+            return getDirtTexture(pos, normal);
+        case GRASS:
+            return getGrassTexture(pos, normal);
+        case SAND:
+            return getSandTexture(pos, normal);
+        case STONE:
+            return getStoneTexture(pos, normal);
+        case CORAL_PINK:
+        case CORAL_ORANGE:
+        case CORAL_PURPLE:
+            return getCoralTexture(pos, mat.albedo);
+        case KELP:
+            return getKelpTexture(pos, mat.albedo);
+        default:
+            // Use default material albedo for other block types
+            return mat.albedo;
+    }
+}
+
+// What a pixel shows, for the denoiser: the first surface along the camera
+// ray, followed through water (the refracted ray, or the reflected one where
+// the reflection is the stronger of the two). No random numbers are used.
+struct PixelSurface {
+    Vec3 albedo{1.0f, 1.0f, 1.0f};
+    Vec3 normal;
+    Vec3 position;
+    bool found = false;               // false: sky, or open water with nothing behind it
+};
+
+PixelSurface findPixelSurface(Ray ray, const World& world, bool insideWater) {
+    PixelSurface out;
+    for (int segment = 0; segment < 4; segment++) {
+        Vec3 hitPos, hitNormal;
+        BlockType hitBlock;
+        if (!world.raycast(ray, MAX_RAY_DISTANCE, hitPos, hitNormal, hitBlock)) return out;
+        if (hitBlock != WATER) {
+            out.albedo = isEmitter(hitBlock) ? Vec3(1.0f, 1.0f, 1.0f) : surfaceAlbedo(hitBlock, hitPos, hitNormal);
+            out.normal = hitNormal;
+            out.position = hitPos;
+            out.found = true;
+            return out;
+        }
+        // The water surface, with the same waves and Fresnel terms as trace()
+        bool fromAbove = !insideWater;
+        Vec3 normal = hitNormal;
+        if (std::abs(hitNormal.y) > 0.9f) {
+            normal = getWaterNormal(hitPos, g_settings.waterAnimation);
+            if (!fromAbove) normal = normal * -1.0f;
+        }
+        float eta = fromAbove ? 1.0f / WATER_IOR : WATER_IOR;
+        float cosI = -normal.dot(ray.direction);
+        if (cosI < 0.0f) {
+            normal = normal * -1.0f;
+            cosI = -cosI;
+        }
+        float sinT2 = eta * eta * (1.0f - cosI * cosI);
+        Vec3 reflectedDir = ray.direction + normal * (2.0f * cosI);
+        float reflectance = 1.0f;
+        Vec3 refractedDir = reflectedDir;
+        if (sinT2 <= 1.0f) {
+            float cosT = std::sqrt(1.0f - sinT2);
+            refractedDir = ray.direction * eta + normal * (eta * cosI - cosT);
+            float r0 = ((1.0f - WATER_IOR) / (1.0f + WATER_IOR)) * ((1.0f - WATER_IOR) / (1.0f + WATER_IOR));
+            reflectance = r0 + (1.0f - r0) * std::pow(1.0f - (fromAbove ? cosI : cosT), 5.0f);
+            if (fromAbove) reflectance = std::min(reflectance, 0.8f);
+        }
+        if (reflectance > 0.5f) {
+            ray = Ray(hitPos + normal * 0.01f, reflectedDir);
+        } else {
+            ray = Ray(hitPos + refractedDir * 0.01f, refractedDir);
+            insideWater = fromAbove;
+        }
+    }
+    return out;
+}
+
 // Minimal PNG writer: 8-bit RGB, stored (uncompressed) deflate blocks.
 // No external library; any viewer or video tool reads the result.
 static uint32_t pngCrc(const uint8_t* data, size_t n, uint32_t crc) {
@@ -2544,6 +2627,15 @@ static bool writePNG(const std::string& filename, const uint8_t* rgb, int width,
 class Renderer {
     std::vector<uint32_t> framebuffer;
     std::vector<Vec3> accumulator;
+    // For the denoiser (filled only while it is on): what each pixel shows,
+    // and the sum of its samples' squared brightness (for their variance)
+    std::vector<PixelSurface> surfaces;
+    std::vector<float> brightnessSquares;
+    std::vector<Vec3> denoised;
+    bool surfacesValid = false;
+    std::vector<Vec3> filterColor[2];
+    std::vector<float> filterVariance[2];
+    Vec3 cameraPosition;              // of the pass being accumulated
     std::atomic<int> nextTile;
     std::atomic<uint64_t> rayCount{0};
     uint64_t frameSeed = 0;
@@ -2570,6 +2662,8 @@ public:
             currentHeight = height;
             framebuffer.resize(width * height);
             accumulator.resize(width * height);
+            surfaces.clear();
+            brightnessSquares.clear();
             reset();
         }
     }
@@ -2577,6 +2671,8 @@ public:
     void reset() {
         sampleCount = 0;
         std::fill(accumulator.begin(), accumulator.end(), Vec3(0, 0, 0));
+        std::fill(brightnessSquares.begin(), brightnessSquares.end(), 0.0f);
+        surfacesValid = false;
     }
     
     void render(const Camera& camera, const World& world, bool cameraMoving) {
@@ -2597,8 +2693,19 @@ public:
         }
 
         bool cameraUnderwater = getCameraUnderwater(camera, world);
+        cameraPosition = camera.position;
 
-        g_pool.run(renderThreadCount(), [&](int) { renderThread(camera, world, cameraUnderwater); });
+        // The denoiser's buffers follow the accumulation: they start with its
+        // first pass. Turned on later, it waits for the next reset.
+        bool gather = g_settings.denoise && (sampleCount == 1 || surfacesValid);
+        if (gather && sampleCount == 1) {
+            surfaces.assign(size_t(currentWidth) * currentHeight, PixelSurface());
+            brightnessSquares.assign(size_t(currentWidth) * currentHeight, 0.0f);
+        }
+        if (!gather) surfacesValid = false;
+
+        g_pool.run(renderThreadCount(), [&](int) { renderThread(camera, world, cameraUnderwater, gather); });
+        if (gather) surfacesValid = true;
         framebufferStale = true;
     }
 
@@ -2610,11 +2717,13 @@ public:
         framebufferStale = false;
         const int total = currentWidth * currentHeight;
         const int threads = std::max(1, std::min(renderThreadCount(), total / 4096));
+        const bool filtered = g_settings.denoise && surfacesValid && sampleCount > 0;
+        if (filtered) denoise();
         g_pool.run(threads, [&](int t) {
             int begin = int(int64_t(total) * t / threads);
             int end = int(int64_t(total) * (t + 1) / threads);
             for (int i = begin; i < end; i++) {
-                Vec3 color = accumulator[i] / float(sampleCount * SAMPLES_PER_PIXEL);
+                Vec3 color = filtered ? denoised[i] : accumulator[i] / float(sampleCount * SAMPLES_PER_PIXEL);
 
                 color.x = color.x / (1.0f + color.x);
                 color.y = color.y / (1.0f + color.y);
@@ -2639,7 +2748,122 @@ public:
     uint64_t getRayCount() const { return rayCount.load(); }
     void resetRayCount() { rayCount = 0; }
 
-    void renderThread(const Camera& camera, const World& world, bool cameraUnderwater) {
+    // Denoiser: an edge-stopping a-trous wavelet filter, guided by each
+    // pixel's surface and by how noisy the pixel is.
+    //
+    // The image is divided by the surface color first, so textures are not
+    // blurred: what gets filtered is the light arriving at the surface. Each
+    // of the five rounds averages a pixel with 24 neighbors (5 x 5, spread
+    // twice as far each round). A neighbor counts less when it lies off the
+    // pixel's surface plane, faces another way, or differs in brightness by
+    // more than the pixel's own noise explains. That noise is the variance of
+    // the pixel's samples: it shrinks as samples accumulate, so the filter
+    // fades out by itself and the image converges to the unfiltered one.
+    void denoise() {
+        const int w = currentWidth, h = currentHeight;
+        const size_t total = size_t(w) * h;
+        const float samples = float(sampleCount * SAMPLES_PER_PIXEL);
+        static const float ALBEDO_FLOOR = 0.02f;
+        auto brightness = [](const Vec3& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; };
+
+        filterColor[0].resize(total);
+        filterColor[1].resize(total);
+        filterVariance[0].resize(total);
+        filterVariance[1].resize(total);
+        denoised.resize(total);
+        const int threads = std::max(1, std::min(renderThreadCount(), h));
+        auto rows = [&](const std::function<void(int, int)>& fn) {
+            g_pool.run(threads, [&](int t) { fn(h * t / threads, h * (t + 1) / threads); });
+        };
+
+        // Light per pixel (color / surface color) and the variance of its mean
+        rows([&](int y0, int y1) {
+            for (size_t i = size_t(y0) * w; i < size_t(y1) * w; i++) {
+                const Vec3& a = surfaces[i].albedo;
+                Vec3 mean = accumulator[i] / samples;
+                Vec3 light(mean.x / std::max(a.x, ALBEDO_FLOOR), mean.y / std::max(a.y, ALBEDO_FLOOR),
+                           mean.z / std::max(a.z, ALBEDO_FLOOR));
+                float l = brightness(light);
+                float spread = std::max(0.0f, brightnessSquares[i] / samples - l * l);
+                filterColor[0][i] = light;
+                filterVariance[0][i] = spread / std::max(1.0f, samples - 1.0f);
+            }
+        });
+
+        static const float kernel[3] = {3.0f / 8.0f, 1.0f / 4.0f, 1.0f / 16.0f};
+        int src = 0;
+        for (int round = 0; round < 5; round++) {
+            const int stride = 1 << round;
+            const std::vector<Vec3>& colorIn = filterColor[src];
+            const std::vector<float>& varIn = filterVariance[src];
+            std::vector<Vec3>& colorOut = filterColor[1 - src];
+            std::vector<float>& varOut = filterVariance[1 - src];
+            rows([&](int y0, int y1) {
+                for (int y = y0; y < y1; y++) {
+                    for (int x = 0; x < w; x++) {
+                        const size_t i = size_t(y) * w + x;
+                        const PixelSurface& p = surfaces[i];
+                        const Vec3 center = colorIn[i];
+                        const float centerL = brightness(center);
+                        // The pixel's noise level: its variance, smoothed over 3 x 3
+                        float var = 0.0f, varWeight = 0.0f;
+                        for (int dy = -1; dy <= 1; dy++) {
+                            for (int dx = -1; dx <= 1; dx++) {
+                                int qx = x + dx, qy = y + dy;
+                                if (qx < 0 || qx >= w || qy < 0 || qy >= h) continue;
+                                float k = (dx == 0 ? 0.5f : 0.25f) * (dy == 0 ? 0.5f : 0.25f);
+                                var += k * varIn[size_t(qy) * w + qx];
+                                varWeight += k;
+                            }
+                        }
+                        const float invNoise = 1.0f / (4.0f * std::sqrt(var / varWeight) + 1e-4f);
+                        // Off-plane tolerance grows a little with distance from the camera
+                        const float invPlane = 1.0f / (0.05f + 0.004f * (p.position - cameraPosition).length());
+
+                        Vec3 sum = center;
+                        float weightSum = 1.0f, varSum = varIn[i];
+                        for (int dy = -2; dy <= 2; dy++) {
+                            int qy = y + dy * stride;
+                            if (qy < 0 || qy >= h) continue;
+                            for (int dx = -2; dx <= 2; dx++) {
+                                int qx = x + dx * stride;
+                                if ((dx == 0 && dy == 0) || qx < 0 || qx >= w) continue;
+                                const size_t j = size_t(qy) * w + qx;
+                                const PixelSurface& q = surfaces[j];
+                                if (q.found != p.found) continue;
+                                float falloff = std::abs(centerL - brightness(colorIn[j])) * invNoise;
+                                float facing = 1.0f;
+                                if (p.found) {
+                                    facing = p.normal.dot(q.normal);
+                                    if (facing < 0.9f) continue;                    // faces are axis-aligned: same or not
+                                    falloff += std::abs(p.normal.dot(q.position - p.position)) * invPlane;
+                                }
+                                float weight = kernel[std::abs(dx)] * kernel[std::abs(dy)] * std::exp(-falloff);
+                                sum += colorIn[j] * weight;
+                                weightSum += weight;
+                                varSum += weight * weight * varIn[j];
+                            }
+                        }
+                        colorOut[i] = sum / weightSum;
+                        varOut[i] = varSum / (weightSum * weightSum);
+                    }
+                }
+            });
+            src = 1 - src;
+        }
+
+        // Back to color
+        rows([&](int y0, int y1) {
+            for (size_t i = size_t(y0) * w; i < size_t(y1) * w; i++) {
+                const Vec3& a = surfaces[i].albedo;
+                const Vec3& light = filterColor[src][i];
+                denoised[i] = Vec3(light.x * std::max(a.x, ALBEDO_FLOOR), light.y * std::max(a.y, ALBEDO_FLOOR),
+                                   light.z * std::max(a.z, ALBEDO_FLOOR));
+            }
+        });
+    }
+
+    void renderThread(const Camera& camera, const World& world, bool cameraUnderwater, bool gather) {
         float aspectRatio = float(currentWidth) / currentHeight;
         const Camera::RayBasis basis = camera.rayBasis(aspectRatio);
         const uint64_t passSeed = frameSeed * 0x9E3779B97F4A7C15ULL + uint64_t(sampleCount);
@@ -2663,16 +2887,30 @@ public:
                 for (int x = startX; x < endX; x++) {
                     Vec3 color(0, 0, 0);
                     rng.seed(passSeed, uint64_t(y) * currentWidth + x);
+                    int idx = y * currentWidth + x;
+
+                    // For the denoiser: the surface at the pixel's center, once per accumulation
+                    if (gather && sampleCount == 1) {
+                        float u = (x + 0.5f - currentWidth/2.0f) / (currentWidth/2.0f);
+                        float v = -(y + 0.5f - currentHeight/2.0f) / (currentHeight/2.0f);
+                        surfaces[idx] = findPixelSurface(Camera::rayFrom(basis, u, v), world, cameraUnderwater);
+                    }
 
                     for (int s = 0; s < SAMPLES_PER_PIXEL; s++) {
                         float u = (x + random01() - currentWidth/2.0f) / (currentWidth/2.0f);
                         float v = -(y + random01() - currentHeight/2.0f) / (currentHeight/2.0f);
                         
                         Ray ray = Camera::rayFrom(basis, u, v);
-                        color = color + trace(ray, world, MAX_BOUNCES, cameraUnderwater, true);
+                        Vec3 sample = trace(ray, world, MAX_BOUNCES, cameraUnderwater, true);
+                        color = color + sample;
+                        if (gather) {
+                            const Vec3& a = surfaces[idx].albedo;
+                            float l = 0.2126f * sample.x / std::max(a.x, 0.02f) + 0.7152f * sample.y / std::max(a.y, 0.02f) +
+                                      0.0722f * sample.z / std::max(a.z, 0.02f);
+                            brightnessSquares[idx] += l * l;
+                        }
                     }
                     
-                    int idx = y * currentWidth + x;
                     accumulator[idx] = accumulator[idx] + color;
                 }
             }
@@ -2800,8 +3038,6 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
         return finish(result);
     }
 
-    const MaterialProps& mat = g_materials[hitBlock];
-
     // Light blocks: weighted against direct light sampling
     if (isEmitter(hitBlock)) {
         Vec3 emission = lampEmission(hitBlock);
@@ -2833,35 +3069,8 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
                               static_cast<int>(std::floor(outside.y)),
                               static_cast<int>(std::floor(outside.z))) == WATER;
 
-    // Get the base albedo from material properties
-    Vec3 albedo = mat.albedo;
-
-    // Apply procedural textures based on block type
-    switch(hitBlock) {
-        case DIRT:
-            albedo = getDirtTexture(hitPos, hitNormal);
-            break;
-        case GRASS:
-            albedo = getGrassTexture(hitPos, hitNormal);
-            break;
-        case SAND:
-            albedo = getSandTexture(hitPos, hitNormal);
-            break;
-        case STONE:
-            albedo = getStoneTexture(hitPos, hitNormal);
-            break;
-        case CORAL_PINK:
-        case CORAL_ORANGE:
-        case CORAL_PURPLE:
-            albedo = getCoralTexture(hitPos, mat.albedo);
-            break;
-        case KELP:
-            albedo = getKelpTexture(hitPos, mat.albedo);
-            break;
-        default:
-            // Use default material albedo for other block types
-            break;
-    }
+    // The block's procedural texture (or plain material color)
+    Vec3 albedo = surfaceAlbedo(hitBlock, hitPos, hitNormal);
 
     Vec3 shadeOrigin = hitPos + hitNormal * 0.01f;
     Vec3 toSun = sun.direction * -1;
@@ -3041,6 +3250,7 @@ int main(int argc, char* argv[]) {
     bool fixedBenchmark = false;
     bool dumpCaustics = false;
     bool samplesGiven = false;
+    bool denoiseGiven = false;
     int startFrame = 0;
     std::string demoFile = "demo.json";
     
@@ -3075,6 +3285,12 @@ int main(int argc, char* argv[]) {
             dumpCaustics = true;
         } else if (arg == "--no-particles") {
             g_settings.enableParticles = false;
+        } else if (arg == "--denoise") {
+            g_settings.denoise = true;
+            denoiseGiven = true;
+        } else if (arg == "--no-denoise") {
+            g_settings.denoise = false;
+            denoiseGiven = true;
         } else if (arg == "--caustic-strength" && i + 1 < argc) {
             g_settings.causticStrength = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--shaft-strength" && i + 1 < argc) {
@@ -3105,6 +3321,8 @@ int main(int argc, char* argv[]) {
                          "  --caustic-strength <x>   contrast of the caustic pattern (default 1, 0 = even light)\n"
                          "  --shaft-strength <x>     brightness of underwater light shafts (default 1)\n"
                          "  --no-particles           no drifting specks in the water\n"
+                         "  --denoise, --no-denoise  filter noise along surfaces (default: on in the window, off for\n"
+                         "                           --offline, --bench and --benchmark)\n"
                          "  --dump-caustics          write the caustic map's layers to output/ as images and exit\n"
                          "  --time <0-1>         time of day (default 0.85; 0.5 is midday)\n"
                          "  --no-caustics, --no-volumetrics   turn an effect off\n"
@@ -3148,6 +3366,10 @@ int main(int argc, char* argv[]) {
         benchWorld.generate(g_settings.worldSeed);
         return runFixedBenchmark(benchWorld, samplesGiven ? g_settings.offlineTargetSamples : 32);
     }
+
+    // The window shows a few samples per pixel, so it is denoised unless told
+    // otherwise. Files and timings stay as rendered unless --denoise is given.
+    if (!denoiseGiven) g_settings.denoise = !offlineMode && !benchmarkMode;
 
     // Offline rendering needs no window, so it also runs on machines without a display.
     if (!offlineMode && SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -3232,7 +3454,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
     std::cout << "KP1: Toggle Caustics | KP2: Toggle Volumetrics\n";
-    std::cout << "KP3: Caustic Quality (Low/Med/High)\n\n";
+    std::cout << "KP3: Caustic Quality (Low/Med/High) | N: Toggle Denoiser\n\n";
     
     // Create output directory for offline rendering
     if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
@@ -3364,6 +3586,12 @@ int main(int argc, char* argv[]) {
                         case SDLK_KP_2:
                             g_settings.enableVolumetrics = !g_settings.enableVolumetrics;
                             std::cout << "Volumetrics: " << (g_settings.enableVolumetrics ? "ON" : "OFF") << "\n";
+                            needsReset = true;
+                            break;
+                        
+                        case SDLK_n:
+                            g_settings.denoise = !g_settings.denoise;
+                            std::cout << "Denoiser: " << (g_settings.denoise ? "ON" : "OFF") << "\n";
                             needsReset = true;
                             break;
                         
