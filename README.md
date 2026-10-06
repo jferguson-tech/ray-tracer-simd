@@ -22,6 +22,8 @@ same clip as a video file.*
 - Lake beds with rocks, coral, kelp and glowing sea lanterns
 - Light blocks are sampled directly, so lamp-lit areas converge quickly
 - Camera path recording, playback, benchmarking and offline rendering (JSON)
+- Denoiser: an edge-stopping wavelet filter guided by each pixel's surface, so the window shows a
+  clean image from 2 samples per pixel
 - Repeatable renders: the same command produces the same image, on any number of threads
 
 ## Performance
@@ -84,6 +86,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--caustic-strength <x>` | Contrast of the caustic pattern (default 1; 0 gives even light) |
 | `--shaft-strength <x>` | Brightness of underwater light shafts (default 1) |
 | `--no-particles` | No drifting specks in the water |
+| `--denoise`, `--no-denoise` | Denoiser on or off (default: on in the window, off for `--offline`, `--bench` and `--benchmark`) |
 | `--dump-caustics` | Write the caustic map's layers to `output/` as images and exit |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
 | `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
@@ -124,6 +127,24 @@ a change against a previous build, keep the old images and compare:
 python compare_images.py output_before output      # PSNR and difference per view
 ```
 
+### Denoiser
+The window is denoised by default (`N` toggles it); `--denoise` does the same for
+`--offline` and `--bench` images. The filter never changes the samples themselves,
+only how they are combined into the picture, and it fades out as samples
+accumulate, so a long render converges to the same image with or without it.
+
+PSNR of the seven `--bench` views against a 1024 samples per pixel reference
+(640x360, lowest and highest view):
+
+| Samples per pixel | As rendered | Denoised |
+|---|---|---|
+| 2 | 23.3 - 33.0 dB | 27.1 - 38.6 dB |
+| 8 | 28.9 - 38.4 dB | 32.0 - 43.0 dB |
+| 32 | 34.9 - 44.2 dB | 36.6 - 47.0 dB |
+
+The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
+7950X (32 threads).
+
 ### Controls (interactive)
 | Keys | Action |
 |---|---|
@@ -136,6 +157,7 @@ python compare_images.py output_before output      # PSNR and difference per vie
 | `F2` / `F3` | Play the path / benchmark it |
 | `F5` / `F6` | Save / load the path |
 | Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic map detail |
+| `N` | Toggle the denoiser |
 | `Esc` | Quit |
 
 The water animates while the view is changing and holds still while a still
@@ -190,6 +212,12 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   shafts and drifting particles are lit through the caustic map, and blocks in or above the
   water cast shadows into it. Sunlight under water is shown about three times brighter than
   it physically is (an artistic gain, as if the eye had adapted)
+- Denoiser: an a-trous wavelet filter (five rounds of 5 x 5 taps, spread twice as far each
+  round). Each pixel records the surface it shows, followed through the water's refraction or
+  reflection. The image is divided by that surface's color, so textures stay sharp and only
+  the light is filtered; neighbors count less when they are off the pixel's surface plane,
+  face another way, or differ in brightness by more than the variance of the pixel's own
+  samples explains
 - Trees, lights and lake decoration (rocks, coral, kelp, sea lanterns) are placed by an integer
   hash of the column, so they are the same on every platform and at any world size; sea
   lanterns are light blocks and are sampled directly
