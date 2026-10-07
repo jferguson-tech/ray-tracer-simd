@@ -111,14 +111,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.51 | 411 |
-| shore | 0.71 | 317 |
-| underwater | 0.73 | 284 |
-| lakebed | 0.70 | 406 |
-| aerial | 0.49 | 424 |
-| deep | 0.85 | 232 |
-| lookup | 0.99 | 253 |
-| total | 4.98 | 318 |
+| lake | 0.50 | 426 |
+| shore | 0.48 | 466 |
+| underwater | 0.69 | 298 |
+| lakebed | 0.58 | 490 |
+| aerial | 0.44 | 476 |
+| deep | 0.72 | 277 |
+| lookup | 0.71 | 352 |
+| total | 4.12 | 385 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -208,6 +208,14 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   column, the height above which a ray toward the sun cannot hit anything. Those cells are
   flagged in a copy of the grid, so sun shadow rays stop at the first flagged cell instead of
   marching to the top of the world. The result is exactly what the full march returns
+- Sun bands: a ray toward the sun stays in one vertical slice of the world, where it is a
+  straight line. The lines through a cell are sorted into narrow bands, and for each cell
+  and band a sweep from the sun's end of the slice records how every ray of that band can
+  end: in the open, in leaves or in another block. Where only one ending is possible, a
+  light-shaft sample or a surface reads its shadow from the table (two bits) instead of
+  marching; where a band's edges split around a block, the ray is marched as before, so
+  the picture is byte-identical. The table settles about 99% of the points in open cells
+  (fewer with the sun almost overhead) and is rebuilt in 15 to 30 ms when the sun moves
 - Persistent worker threads for render passes, image conversion and the caustic map; the
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by

@@ -1157,6 +1157,15 @@ class World {
     // block". Written by the main thread before the render threads start; they
     // only read it.
     mutable std::vector<uint8_t> sunBlocks;
+    // Sun bands (see classifySunBands): for the cells the flag leaves open, what
+    // a ray toward the sun finds, by where in the cell it starts.
+    mutable std::vector<uint16_t> sunBands;         // per cell: 7 bands of 2 bits, and BAND_WATER
+    mutable std::vector<int16_t> sunBandFirst;      // per column along the sun's axis and height: a cell's first band
+    mutable std::vector<uint16_t> sunColumns;       // per column of the world: see classifySunBands
+    mutable bool sunBandsValid = false;
+    mutable bool sunBandAlongX = true;
+    mutable int sunBandStep = 1;
+    mutable float sunBandRise = 0.0f, sunBandBase = 0.0f, sunBandPerUnit = 0.0f;
     mutable Vec3 sunClearDir;
     mutable uint64_t sunClearGeneration = 0;
     mutable bool sunClearValid = false;
@@ -1413,9 +1422,188 @@ public:
                 }
             }
         }
+        sunBandsValid = false;
+        if (!vertical) classifySunBands(alongX, (alongX ? toSun.x : toSun.z) > 0 ? 1 : -1, rise);
         sunClearValid = true;
     }
 
+    // What a ray toward the sun finds, for the cells below the clear line. Such
+    // a ray stays in one slice of the world, and there it is a straight line
+    // y = c + rise * u (u counts columns toward the sun). A cell is crossed by
+    // the lines with c in a range 1 + rise wide; that range is cut into bands
+    // (six widths per cell, so a cell touches at most seven), the same bands
+    // for the whole slice. All rays of one band cross the same staircase of
+    // cells, give or take the cells the band's two edges split. Walking that
+    // staircase back from the sun's end gives, per cell and band, every way a
+    // ray from there can end: nothing, leaves, or another solid block. Where
+    // only one is possible it is stored and no march is needed (sunBandAt);
+    // where two are, the entry stays empty and the ray is marched as before.
+    // Cells above the clear line get "nothing" in every band, and each word
+    // also says whether its cell is water, so a sample needs this table only.
+    //
+    // Most samples are above the clear line, though, and spread over far more
+    // cells than fit in the cache. sunColumns answers those from a table small
+    // enough to stay there: per column of the world, the height the clear cells
+    // start at (low byte) and the height the water among them ends at (high byte).
+    //
+    // A band is taken a little wider than it is (`slack`), far more than the
+    // rounding of a march or of the lookup, so a ray is always covered by the
+    // band it is looked up in. A solid block only counts when it is well inside
+    // the 100 blocks a sun shadow ray travels.
+    void classifySunBands(bool alongX, int step, float riseIn) const {
+        const double rise = riseIn;
+        const double width = (1.0 + rise) / 6.0;
+        const double slack = 0.005 * (1.0 + rise);
+        const double base = -rise * WORLD_SIZE - 1.0;       // below the lowest c of any cell
+        const int bandCount = static_cast<int>((WORLD_HEIGHT + rise * WORLD_SIZE + 2.0) / width) + 2;
+        const double perColumn = std::sqrt(1.0 + rise * rise);          // ray length per column
+        const int reach = static_cast<int>((SUN_SHADOW_REACH - 1.0f) / perColumn) - 1;   // columns ahead a hit may be
+
+        sunBandAlongX = alongX;
+        sunBandStep = step;
+        sunBandRise = riseIn;
+        sunBandBase = static_cast<float>(base);
+        sunBandPerUnit = static_cast<float>(1.0 / width);
+        sunBandFirst.resize(size_t(WORLD_SIZE) * WORLD_HEIGHT);
+        for (int i = 0; i < WORLD_SIZE; i++) {
+            for (int y = 0; y < WORLD_HEIGHT; y++) {
+                sunBandFirst[size_t(i) * WORLD_HEIGHT + y] =
+                    static_cast<int16_t>(std::floor((y - rise * (i + 1) - base) / width));
+            }
+        }
+
+        // Every cell's word before any band is entered, and the column table
+        const int threads = std::min(renderThreadCount(), WORLD_SIZE);
+        sunBands.resize(blocks.size());
+        sunColumns.resize(size_t(WORLD_SIZE) * WORLD_SIZE);
+        g_pool.run(threads, [&](int t) {
+            const int zBegin = int(int64_t(WORLD_SIZE) * t / threads);
+            const int zEnd = int(int64_t(WORLD_SIZE) * (t + 1) / threads);
+            for (int i = cellIndex(0, 0, zBegin); i < cellIndex(0, 0, zEnd); i++) {
+                const uint8_t cell = sunBlocks[i];
+                sunBands[i] = static_cast<uint16_t>(((cell & ~SUN_CLEAR) == WATER ? BAND_WATER : 0) |
+                                                    ((cell & SUN_CLEAR) ? BAND_ALL_CLEAR : 0));
+            }
+            for (int z = zBegin; z < zEnd; z++) {
+                for (int x = 0; x < WORLD_SIZE; x++) {
+                    auto at = [&](int y) { return sunBlocks[cellIndex(x, y, z)]; };
+                    int clearFrom = WORLD_HEIGHT;
+                    while (clearFrom > 0 && (at(clearFrom - 1) & SUN_CLEAR)) clearFrom--;
+                    int waterEnd = clearFrom;
+                    while (waterEnd < WORLD_HEIGHT && at(waterEnd) == (WATER | SUN_CLEAR)) waterEnd++;
+                    // Water has to be the lower part of the clear cells; if not, the column gets no shortcut
+                    for (int y = waterEnd; y < WORLD_HEIGHT; y++) {
+                        if (at(y) != (AIR | SUN_CLEAR)) clearFrom = waterEnd = 255;
+                    }
+                    sunColumns[x + size_t(z) * WORLD_SIZE] = static_cast<uint16_t>(clearFrom | (waterEnd << 8));
+                }
+            }
+        });
+
+        enum : uint8_t { ENDS_CLEAR = 1, ENDS_LEAF = 2, ENDS_OPAQUE = 4 };
+        g_pool.run(threads, [&](int t) {
+            const int lineBegin = int(int64_t(WORLD_SIZE) * t / threads);
+            const int lineEnd = int(int64_t(WORLD_SIZE) * (t + 1) / threads);
+            // Per height, for the column being worked on and the one after it:
+            // the ways a ray can end, and the furthest column a block it may hit is in
+            uint8_t endsA[WORLD_HEIGHT], endsB[WORLD_HEIGHT];
+            int farA[WORLD_HEIGHT], farB[WORLD_HEIGHT];
+            for (int line = lineBegin; line < lineEnd; line++) {
+                auto index = [&](int i, int y) {
+                    int a = step > 0 ? i : WORLD_SIZE - 1 - i;
+                    return alongX ? cellIndex(a, y, line) : cellIndex(line, y, a);
+                };
+                for (int band = 0; band < bandCount; band++) {
+                    const double low = base + band * width - slack;             // the band's lowest line
+                    const double high = base + (band + 1) * width + slack;      // ... and its highest
+                    int iEnd = std::min(WORLD_SIZE - 1, static_cast<int>(std::floor((topY + 1 - low) / rise)) + 1);
+                    int iBegin = std::max(0, static_cast<int>(std::floor(-high / rise)) - 1);
+                    uint8_t* ends = endsA; uint8_t* endsNext = endsB;
+                    int* far = farA; int* farNext = farB;
+                    for (int i = iEnd; i >= iBegin; i--) {
+                        // Heights the band covers in this column, and where it enters the next
+                        const int yLow = static_cast<int>(std::floor(low + rise * i));
+                        const int yHigh = static_cast<int>(std::floor(high + rise * (i + 1)));
+                        const int yLowNext = static_cast<int>(std::floor(low + rise * (i + 1)));
+                        for (int y = std::min(yHigh, topY); y >= std::max(yLow, 0); y--) {
+                            const int idx = index(i, y);
+                            const uint8_t cell = sunBlocks[idx];
+                            if (cell != AIR && cell != WATER) continue;         // solid, or flagged clear
+                            uint8_t found = 0;
+                            int furthest = -1;
+                            // A ray leaves the cell upward or toward the sun
+                            auto into = [&](int ni, int ny, const uint8_t* state, const int* stateFar) {
+                                if (ny > topY || ni >= WORLD_SIZE) { found |= ENDS_CLEAR; return; }
+                                const uint8_t next = sunBlocks[index(ni, ny)];
+                                if (next & SUN_CLEAR) { found |= ENDS_CLEAR; return; }
+                                if (next == AIR || next == WATER) {
+                                    found |= state[ny];
+                                    furthest = std::max(furthest, stateFar[ny]);
+                                } else {
+                                    found |= next == LEAVES ? ENDS_LEAF : ENDS_OPAQUE;
+                                    furthest = std::max(furthest, ni);
+                                }
+                            };
+                            if (y < yHigh) into(i, y + 1, ends, far);
+                            if (y >= yLowNext) into(i + 1, y, endsNext, farNext);
+                            ends[y] = found;
+                            far[y] = furthest;
+
+                            const int slot = band - sunBandFirst[size_t(i) * WORLD_HEIGHT + y];
+                            if (slot < 0 || slot > 6) continue;
+                            unsigned code = 0;
+                            if (found == ENDS_CLEAR) code = 1;
+                            else if (furthest - i <= reach) code = found == ENDS_LEAF ? 2 : found == ENDS_OPAQUE ? 3 : 0;
+                            sunBands[idx] |= static_cast<uint16_t>(code << (2 * slot));
+                        }
+                        std::swap(ends, endsNext);
+                        std::swap(far, farNext);
+                    }
+                }
+            }
+        });
+        sunBandsValid = true;
+    }
+
+    // For a point in this cell (inside the world): bits 0-1 say what a ray
+    // toward the sun from it finds (1 nothing, 2 leaves, 3 another solid block,
+    // 0 not settled: march it), bit 2 whether the cell is water.
+    inline unsigned sunBandAt(int cx, int cy, int cz, float px, float py, float pz) const {
+        const unsigned columnInfo = sunColumns[cx + size_t(cz) * WORLD_SIZE];
+        if (cy >= int(columnInfo & 0xFF)) return 1u | (cy < int(columnInfo >> 8) ? 4u : 0u);
+        const float along = sunBandAlongX ? px : pz;
+        const int cell = sunBandAlongX ? cx : cz;
+        const float u = sunBandStep > 0 ? along : float(WORLD_SIZE) - along;
+        const int column = sunBandStep > 0 ? cell : WORLD_SIZE - 1 - cell;
+        const float c = py - sunBandRise * u;
+        const int band = static_cast<int>((c - sunBandBase) * sunBandPerUnit);
+        const int slot = std::min(6, std::max(0, band - sunBandFirst[size_t(column) * WORLD_HEIGHT + cy]));
+        const unsigned word = sunBands[cellIndex(cx, cy, cz)];
+        return ((word >> 15) << 2) | ((word >> (2 * slot)) & 3);
+    }
+
+    // Can a packet lane that starts in this cell, outside the world, get in?
+    // It takes one step and ends unless that step lands inside, so only from a
+    // cell that touches the world's side the ray is heading for.
+    static inline bool laneMayEnter(int cx, int cy, int cz, const Vec3& dir) {
+        const bool outX = cx < 0 || cx >= WORLD_SIZE, outY = cy < 0 || cy >= WORLD_HEIGHT;
+        const bool outZ = cz < 0 || cz >= WORLD_SIZE;
+        if (int(outX) + int(outY) + int(outZ) != 1) return false;
+        if (outX) return cx == (dir.x > 0 ? -1 : WORLD_SIZE);
+        if (outY) return cy == (dir.y > 0 ? -1 : WORLD_HEIGHT);
+        return cz == (dir.z > 0 ? -1 : WORLD_SIZE);
+    }
+
+    // The band table, if `dir` is the direction it was built for and rays of
+    // length `maxDist` can use it
+    inline bool sunBandsFor(const Vec3& dir, float maxDist) const {
+        return sunBandsValid && sunClearValid && maxDist == SUN_SHADOW_REACH &&
+               dir.x == sunClearDir.x && dir.y == sunClearDir.y && dir.z == sunClearDir.z;
+    }
+
+    static constexpr float SUN_SHADOW_REACH = 100.0f;   // how far a sun shadow ray travels
+    static constexpr uint16_t BAND_WATER = 0x8000;      // in a sunBands word: the cell is water
+    static constexpr uint16_t BAND_ALL_CLEAR = 0x1555;  // ... and "nothing" in all seven bands
     static constexpr uint8_t SUN_CLEAR = 0x80;      // flag bit in the sun grid (see prepareSunShadows)
 
     static inline bool inWorld(int x, int y, int z) {
@@ -1694,6 +1882,19 @@ public:
 
     // Sun shadow test: true if a solid block lies between `origin` and the sun.
     bool sunOccluded(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        if (sunBandsFor(dir, maxDist)) {
+            int x = static_cast<int>(std::floor(origin.x));
+            int y = static_cast<int>(std::floor(origin.y));
+            int z = static_cast<int>(std::floor(origin.z));
+            if (inWorld(x, y, z)) {
+                unsigned found = sunBandAt(x, y, z, origin.x, origin.y, origin.z) & 3;
+                if (found) {
+                    t_rayCount++;           // settled by the table; still one ray
+                    return found != 1;
+                }
+                return sunMarch(origin.x, origin.y, origin.z, dir, maxDist) != AIR;
+            }
+        }
         return firstSolid(origin, dir, maxDist) != AIR;
     }
 
@@ -1705,6 +1906,42 @@ public:
             return AIR;                             // the packet version does not enter from outside
         }
         return firstSolid(origin, dir, maxDist);
+    }
+
+    // One sun shadow ray from inside the world, for a sun direction along one
+    // horizontal axis (the case the band table exists for): the ray stays in
+    // its slice, so each step is a choice between two axes, made without a
+    // branch. `dir` is used as given. With the direction normalized this is
+    // one lane of raycastShadow8, with it as passed to firstSolid it is that
+    // march; the arithmetic and the order of the tests are the same.
+    uint8_t sunMarch(float ox, float oy, float oz, const Vec3& dir, float maxDist) const {
+        t_rayCount++;
+        const bool alongX = sunBandAlongX;
+        const float oa = alongX ? ox : oz, da = alongX ? dir.x : dir.z;
+        const float fa = std::floor(oa), fy = std::floor(oy);
+        int a = static_cast<int>(fa), y = static_cast<int>(fy);
+        const int stepA = da > 0 ? 1 : -1;
+        float tMaxA = (fa + (stepA > 0 ? 1.0f : 0.0f) - oa) / da;
+        float tMaxY = (fy + 1.0f - oy) / dir.y;
+        const float tDeltaA = stepA / da, tDeltaY = 1 / dir.y;
+        const int aEnd = stepA > 0 ? WORLD_SIZE : -1;
+        const int idxStepA = alongX ? stepA : stepA * WORLD_SIZE * WORLD_HEIGHT;
+        int idx = cellIndex(static_cast<int>(std::floor(ox)), y, static_cast<int>(std::floor(oz)));
+        const uint8_t* grid = sunBlocks.data();
+        for (;;) {
+            const uint8_t block = grid[idx];
+            if (block & SUN_CLEAR) return AIR;
+            if (block != AIR && block != WATER) return block;
+            // Equal distances: the three-axis marches take y before z, but x after y
+            const bool along = alongX ? tMaxA < tMaxY : !(tMaxY < tMaxA);
+            const float dist = along ? tMaxA : tMaxY;
+            tMaxA += along ? tDeltaA : 0.0f;
+            tMaxY += along ? 0.0f : tDeltaY;
+            a += along ? stepA : 0;
+            y += along ? 0 : 1;
+            idx += along ? idxStepA : WORLD_SIZE;
+            if (!(dist < maxDist) || a == aEnd || y > topY) return AIR;
+        }
     }
 
     // 8-wide shadow raycast: 8 origins, one shared direction (volumetric shadow
@@ -2256,9 +2493,10 @@ inline Vec3 causticColor(float x, float z, float depth, const SunLight& sun) {
                 causticAt(x + hx * shift, z + hz * shift, depth));
 }
 
-// Calculate volumetrics: sunlight scattered toward the eye along a ray. The
-// shadow rays all point at the sun, so they are marched as SIMD packets
-// (raycastShadow8).
+// Calculate volumetrics: sunlight scattered toward the eye along a ray. Each
+// sample asks whether it sees the sun. The sun band table answers most of them
+// (World::classifySunBands); the rest are marched, as SIMD packets
+// (raycastShadow8) or, when only a lane or two are left, one at a time.
 //
 // fullQuality marches all 12 steps (rays the camera sees directly or through
 // water). Otherwise one randomly chosen step is evaluated and scaled by 12: the
@@ -2278,16 +2516,26 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     // Water is murkier than air, so its shafts are sampled over a shorter stretch
     float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
 
-    // Jittered sample positions along the ray (SoA, padded to 2 groups of 8).
-    // The block at each sample is read from the grid used for sun shadow rays:
-    // besides telling water from air, its flag says when the sample is above
-    // everything between it and the sun, so no shadow ray is needed for it (a
-    // march from that cell would stop at once with the same answer).
+    // Jittered sample positions along the ray (SoA, padded to 2 groups of 8),
+    // and how much sun reaches each: 1, 0.3 through leaves, 0 behind solid
+    // blocks or outside this ray's medium. For most samples the sun band table
+    // says so at once; the rest are marched below.
     Vec3 toSun = -sun.direction;
     const uint8_t* sunGrid = world.gridFor(toSun);
+    const bool useBands = world.sunBandsFor(toSun, World::SUN_SHADOW_REACH);
+    const int groups = (evaluated + 7) / 8;
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
-    bool laneActive[16];        // the sample is in this ray's medium
-    bool needsMarch[16];        // ... and its view of the sun has to be traced
+    alignas(32) float visible[16];
+    bool needsMarch[16];        // the sample's view of the sun has to be traced
+    for (int i = evaluated; i < groups * 8; i++) {      // pad the last group of 8
+        ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
+        visible[i] = 0;
+        needsMarch[i] = false;
+    }
+    static const float SEEN[4] = {0.0f, 1.0f, 0.3f, 0.0f};      // by what the table says (see sunBandAt)
+    int marching[2] = {0, 0};
+    int marchingOutside = 0;
+    int settledRays = 0;
     for (int i = 0; i < evaluated; i++) {
         float t = stepSize * (firstStep + i + random01() * 0.5f);
         Vec3 samplePos = ray.at(t);
@@ -2298,40 +2546,64 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         int cx = static_cast<int>(std::floor(samplePos.x));
         int cy = static_cast<int>(std::floor(samplePos.y));
         int cz = static_cast<int>(std::floor(samplePos.z));
-        uint8_t cell = World::inWorld(cx, cy, cz) ? sunGrid[World::cellIndex(cx, cy, cz)] : uint8_t(AIR);
-        bool sampleInWater = (cell & ~World::SUN_CLEAR) == WATER;
-        laneActive[i] = (sampleInWater == inWater);
-        needsMarch[i] = laneActive[i] && !(cell & World::SUN_CLEAR);
+        unsigned info = 0;                              // outside the world: air, to be marched
+        const bool inside = World::inWorld(cx, cy, cz);
+        if (inside) {
+            if (useBands) {
+                info = world.sunBandAt(cx, cy, cz, samplePos.x, samplePos.y, samplePos.z);
+            } else {
+                // No table for this direction: the grid's flag settles the cells above everything
+                uint8_t cell = sunGrid[World::cellIndex(cx, cy, cz)];
+                info = ((cell & ~World::SUN_CLEAR) == WATER ? 4u : 0u) | ((cell & World::SUN_CLEAR) ? 1u : 0u);
+            }
+        } else if (evaluated != 1 && !World::laneMayEnter(cx, cy, cz, toSun)) {
+            info = 1;                                   // a march from here ends after one step, in the open
+        }
+        const bool active = ((info & 4) != 0) == inWater;       // the sample is in this ray's medium
+        const unsigned found = info & 3;
+        const bool march = active && found == 0;
+        needsMarch[i] = march;
+        visible[i] = SEEN[active ? found : 0];
+        marching[i >> 3] += march ? 1 : 0;
+        marchingOutside += (march && !inside) ? 1 : 0;
+        settledRays += (active && !march) ? 1 : 0;
     }
-    const int groups = (evaluated + 7) / 8;
-    for (int i = evaluated; i < groups * 8; i++) {      // pad the last group of 8
-        ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
-        laneActive[i] = false;
-        needsMarch[i] = false;
-    }
+    t_rayCount += settledRays;
 
-    // How much sun reaches each sample: 1, 0.3 through leaves, 0 behind solid blocks
-    alignas(32) float visible[16];
-    bool anyVisible = false;
-    for (int group = 0; group < groups; group++) {
-        int base = group * 8;
-        uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        int marching = 0;
-        for (int L = 0; L < 8; L++) marching += needsMarch[base + L] ? 1 : 0;
-        for (int L = 0; L < 8; L++) t_rayCount += (laneActive[base + L] && !needsMarch[base + L]) ? 1 : 0;
-        if (evaluated == 1) {
-            // A packet with one live lane costs almost a full packet; use a plain ray.
-            if (marching) hitBlock[0] = world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, 100.0f);
-        } else if (marching) {
-            world.raycastShadow8(sx + base, sy + base, sz + base, toSun, 100.0f,
-                                 needsMarch + base, hitBlock);
+    auto seenThrough = [](uint8_t block) { return block == AIR ? 1.0f : block == LEAVES ? 0.3f : 0.0f; };
+    const bool laneByLane = useBands && marchingOutside == 0;   // what sunMarch needs
+    if (evaluated == 1) {
+        // A packet with one live lane costs almost a full packet; use a plain ray.
+        if (marching[0]) {
+            visible[0] = seenThrough(laneByLane
+                ? world.sunMarch(sx[0], sy[0], sz[0], toSun, World::SUN_SHADOW_REACH)
+                : world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, World::SUN_SHADOW_REACH));
         }
-        for (int L = 0; L < 8; L++) {
-            uint8_t hb = hitBlock[L];
-            visible[base + L] = !laneActive[base + L] ? 0.0f : hb == AIR ? 1.0f : hb == LEAVES ? 0.3f : 0.0f;
-            anyVisible = anyVisible || visible[base + L] > 0.0f;
+    } else {
+        const Vec3 laneDir = toSun.normalize();
+        for (int group = 0; group < groups; group++) {
+            if (!marching[group]) continue;
+            int base = group * 8;
+            // A lane or two: one at a time is quicker than a packet that is mostly idle
+            if (laneByLane && marching[group] <= 2) {
+                for (int L = 0; L < 8; L++) {
+                    if (needsMarch[base + L]) {
+                        visible[base + L] = seenThrough(world.sunMarch(sx[base + L], sy[base + L], sz[base + L],
+                                                                       laneDir, World::SUN_SHADOW_REACH));
+                    }
+                }
+                continue;
+            }
+            uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            world.raycastShadow8(sx + base, sy + base, sz + base, toSun, World::SUN_SHADOW_REACH,
+                                 needsMarch + base, hitBlock);
+            for (int L = 0; L < 8; L++) {
+                if (needsMarch[base + L]) visible[base + L] = seenThrough(hitBlock[L]);
+            }
         }
     }
+    bool anyVisible = false;
+    for (int i = 0; i < evaluated; i++) anyVisible = anyVisible || visible[i] > 0.0f;
     // No sample sees the sun: every term below would be multiplied by zero
     if (!anyVisible) return Vec3(0, 0, 0);
     const float scaleUp = float(numSamples) / float(evaluated);
@@ -3204,7 +3476,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
             Vec3 entry = shadeOrigin + up * pathLength;
             entry.y = float(WATER_LEVEL) + 0.02f;
             bool sunVisible = world.firstSolid(shadeOrigin, up, pathLength) == AIR &&
-                              !world.sunOccluded(entry, toSun, 100.0f);
+                              !world.sunOccluded(entry, toSun, World::SUN_SHADOW_REACH);
             if (sunVisible) {
                 directLight = sunLight * causticColor(hitPos.x, hitPos.z, depthBelow, sun) *
                               waterTransmittance(pathLength) * (sun.beamGain * UNDERWATER_SUN_GAIN * cosSun);
@@ -3213,7 +3485,7 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
     } else {
         // Direct sun lighting (solid blocks cast shadows; water does not block the sun)
         float sunDot = hitNormal.dot(toSun);
-        if (sunDot > 0.0f && !world.sunOccluded(shadeOrigin, toSun, 100.0f)) {
+        if (sunDot > 0.0f && !world.sunOccluded(shadeOrigin, toSun, World::SUN_SHADOW_REACH)) {
             directLight = sunLight * sunDot;
         }
     }
