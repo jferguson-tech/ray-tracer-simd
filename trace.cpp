@@ -1507,7 +1507,7 @@ public:
             // Per height, for the column being worked on and the one after it:
             // the ways a ray can end, and the furthest column a block it may hit is in
             uint8_t endsA[WORLD_HEIGHT], endsB[WORLD_HEIGHT];
-            int farA[WORLD_HEIGHT], farB[WORLD_HEIGHT];
+            int hitColumnA[WORLD_HEIGHT], hitColumnB[WORLD_HEIGHT];
             for (int line = lineBegin; line < lineEnd; line++) {
                 auto index = [&](int i, int y) {
                     int a = step > 0 ? i : WORLD_SIZE - 1 - i;
@@ -1519,7 +1519,7 @@ public:
                     int iEnd = std::min(WORLD_SIZE - 1, static_cast<int>(std::floor((topY + 1 - low) / rise)) + 1);
                     int iBegin = std::max(0, static_cast<int>(std::floor(-high / rise)) - 1);
                     uint8_t* ends = endsA; uint8_t* endsNext = endsB;
-                    int* far = farA; int* farNext = farB;
+                    int* hitColumn = hitColumnA; int* hitColumnNext = hitColumnB;
                     for (int i = iEnd; i >= iBegin; i--) {
                         // Heights the band covers in this column, and where it enters the next
                         const int yLow = static_cast<int>(std::floor(low + rise * i));
@@ -1532,22 +1532,22 @@ public:
                             uint8_t found = 0;
                             int furthest = -1;
                             // A ray leaves the cell upward or toward the sun
-                            auto into = [&](int ni, int ny, const uint8_t* state, const int* stateFar) {
+                            auto into = [&](int ni, int ny, const uint8_t* state, const int* stateHitColumn) {
                                 if (ny > topY || ni >= WORLD_SIZE) { found |= ENDS_CLEAR; return; }
                                 const uint8_t next = sunBlocks[index(ni, ny)];
                                 if (next & SUN_CLEAR) { found |= ENDS_CLEAR; return; }
                                 if (next == AIR || next == WATER) {
                                     found |= state[ny];
-                                    furthest = std::max(furthest, stateFar[ny]);
+                                    furthest = std::max(furthest, stateHitColumn[ny]);
                                 } else {
                                     found |= next == LEAVES ? ENDS_LEAF : ENDS_OPAQUE;
                                     furthest = std::max(furthest, ni);
                                 }
                             };
-                            if (y < yHigh) into(i, y + 1, ends, far);
-                            if (y >= yLowNext) into(i + 1, y, endsNext, farNext);
+                            if (y < yHigh) into(i, y + 1, ends, hitColumn);
+                            if (y >= yLowNext) into(i + 1, y, endsNext, hitColumnNext);
                             ends[y] = found;
-                            far[y] = furthest;
+                            hitColumn[y] = furthest;
 
                             const int slot = band - sunBandFirst[size_t(i) * WORLD_HEIGHT + y];
                             if (slot < 0 || slot > 6) continue;
@@ -1557,7 +1557,7 @@ public:
                             sunBands[idx] |= static_cast<uint16_t>(code << (2 * slot));
                         }
                         std::swap(ends, endsNext);
-                        std::swap(far, farNext);
+                        std::swap(hitColumn, hitColumnNext);
                     }
                 }
             }
