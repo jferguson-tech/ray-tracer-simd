@@ -90,6 +90,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--temporal`, `--no-temporal` | The denoiser also reuses the previous view's samples (default: on in the window). With `--offline --denoise`, a frame then depends on the frames rendered before it |
 | `--dump-caustics` | Write the caustic map's layers to `output/` as images and exit |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
+| `--no-lamp-resampling` | Pick one nearby light block at random instead of weighing them all first (noisier; for comparison) |
 | `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
 
 ### Fixed benchmark
@@ -111,14 +112,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.50 | 426 |
-| shore | 0.48 | 466 |
-| underwater | 0.69 | 298 |
-| lakebed | 0.58 | 490 |
-| aerial | 0.44 | 476 |
-| deep | 0.72 | 277 |
-| lookup | 0.71 | 352 |
-| total | 4.12 | 385 |
+| lake | 0.54 | 410 |
+| shore | 0.51 | 459 |
+| underwater | 0.73 | 303 |
+| lakebed | 0.63 | 481 |
+| aerial | 0.47 | 465 |
+| deep | 0.77 | 278 |
+| lookup | 0.76 | 348 |
+| total | 4.42 | 380 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -220,6 +221,13 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
   multiple importance sampling) and one cosine-weighted bounce that gathers sky and surface light
+- Light blocks are resampled: a surface takes a random point on each of the up to eight light
+  blocks near it, works out in one 8-wide pass (one division, no square root) what each would
+  add without its shadow, picks one with a chance in proportion to that and traces a single
+  shadow ray to it. The average stays the same; the ray goes where the light is. Against a
+  512-sample reference at dusk (`--bench --time 0.99`), 32 samples per pixel score 0.5 to
+  3.9 dB higher than with one block picked at random (34.1-39.4 dB to 34.6-41.0 dB), for
+  about 9% more time per sample; in daylight, where lamps add little, 0.1 to 0.8 dB
 - Water surface: a sum of eight waves in different directions (5-block swells down to
   half-block ripples). Fresnel reflection and refraction from both sides, split on camera rays
   and chosen by probability on indirect paths; from below, total internal reflection leaves a
