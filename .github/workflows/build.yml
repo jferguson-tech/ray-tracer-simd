@@ -46,7 +46,17 @@ jobs:
         run: |
           bash tests/image_hashes.sh > actual.sha256
           cat actual.sha256
-          diff tests/images.sha256 actual.sha256
+          diff tests/images_linux.sha256 actual.sha256
+      - name: Keep the images if they did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-linux
+          path: |
+            actual.sha256
+            output_first
+            output_bench
+            output_denoised
 
   windows:
     runs-on: windows-latest
@@ -91,4 +101,14 @@ jobs:
         run: |
           bash tests/image_hashes.sh > actual.sha256
           cat actual.sha256
-          diff tests/images.sha256 actual.sha256
+          diff tests/images_windows.sha256 actual.sha256
+      - name: Keep the images if they did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-windows
+          path: |
+            actual.sha256
+            output_first
+            output_bench
+            output_denoised
