@@ -128,6 +128,12 @@ a change against a previous build, keep the old images and compare:
 python compare_images.py output_before output      # PSNR and difference per view
 ```
 
+Every pull request is also checked for this: the CI renders two offline frames and
+the seven `--bench` views (plain and denoised) and compares their SHA-256 with the
+lists in `tests/`. Linux and Windows each have their own list, because the two
+compilers' math libraries round a few functions differently; on one platform the
+images are the same on every run.
+
 ### Denoiser
 The window is denoised by default (`N` toggles it); `--denoise` does the same for
 `--offline` and `--bench` images. The filter never changes the samples themselves,

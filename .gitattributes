@@ -1,0 +1,2 @@
+tests/*.sh text eol=lf
+tests/*.sha256 text eol=lf

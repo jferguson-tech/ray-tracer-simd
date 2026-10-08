@@ -34,9 +34,29 @@ jobs:
           test ! -e output/frame_00000.png
           cmp output_first/frame_00001.png output/frame_00001.png
       - name: Fixed benchmark
-        run: ./pathtracer --bench --samples 2 --resolution 1
+        run: |
+          ./pathtracer --bench --samples 2 --resolution 1
+          mv output output_bench
       - name: Fixed benchmark, denoised
-        run: ./pathtracer --bench --samples 2 --resolution 1 --denoise
+        run: |
+          ./pathtracer --bench --samples 2 --resolution 1 --denoise
+          mv output output_denoised
+      - name: Images match the recorded hashes
+        shell: bash
+        run: |
+          bash tests/image_hashes.sh > actual.sha256
+          cat actual.sha256
+          diff tests/images_linux.sha256 actual.sha256
+      - name: Keep the images if they did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-linux
+          path: |
+            actual.sha256
+            output_first
+            output_bench
+            output_denoised
 
   windows:
     runs-on: windows-latest
@@ -68,7 +88,27 @@ jobs:
           cmp output_first/frame_00001.png output/frame_00001.png
       - name: Fixed benchmark
         shell: bash
-        run: ./pathtracer.exe --bench --samples 2 --resolution 1
+        run: |
+          ./pathtracer.exe --bench --samples 2 --resolution 1
+          mv output output_bench
       - name: Fixed benchmark, denoised
         shell: bash
-        run: ./pathtracer.exe --bench --samples 2 --resolution 1 --denoise
+        run: |
+          ./pathtracer.exe --bench --samples 2 --resolution 1 --denoise
+          mv output output_denoised
+      - name: Images match the recorded hashes
+        shell: bash
+        run: |
+          bash tests/image_hashes.sh > actual.sha256
+          cat actual.sha256
+          diff tests/images_windows.sha256 actual.sha256
+      - name: Keep the images if they did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-windows
+          path: |
+            actual.sha256
+            output_first
+            output_bench
+            output_denoised
