@@ -1364,6 +1364,7 @@ public:
             for (int y = 0; y < WORLD_HEIGHT; y++)
                 for (int x = 0; x < WORLD_SIZE; x++)
                     if (getBlock(x, y, z) != AIR) topY = std::max(topY, y);
+        buildSkyTiles();
         buildLightCells();
         generation++;
     }
@@ -1647,6 +1648,66 @@ public:
 
     std::vector<LightCell> lightCells;
 
+    // Open sky, coarsely: the columns are grouped in tiles of SKY_TILE x
+    // SKY_TILE, and skyTiles holds per tile the height from which the tile and
+    // the ring of columns around it are empty. A rising ray that stays at or
+    // above that height in every tile it crosses cannot hit anything
+    // (skyAhead), and most rays that end in the sky are settled that way in a
+    // few steps instead of a march through every cell.
+    static constexpr int SKY_SHIFT = 2;
+    static constexpr int SKY_TILE = 1 << SKY_SHIFT;
+    static constexpr int SKY_TILES = WORLD_SIZE / SKY_TILE;     // per side
+    std::vector<uint8_t> skyTiles;
+
+    void buildSkyTiles() {
+        skyTiles.assign(size_t(SKY_TILES) * SKY_TILES, 0);
+        for (int z = 0; z < WORLD_SIZE; z++) {
+            for (int x = 0; x < WORLD_SIZE; x++) {
+                int clearFrom = 0;
+                for (int y = topY; y >= 0; y--) {
+                    if (getBlock(x, y, z) != AIR) { clearFrom = y + 1; break; }
+                }
+                // The column counts for its own tile and for any tile it borders
+                for (int tz = std::max(0, z - 1) >> SKY_SHIFT; tz <= std::min(WORLD_SIZE - 1, z + 1) >> SKY_SHIFT; tz++) {
+                    for (int tx = std::max(0, x - 1) >> SKY_SHIFT; tx <= std::min(WORLD_SIZE - 1, x + 1) >> SKY_SHIFT; tx++) {
+                        uint8_t& tile = skyTiles[tx + size_t(tz) * SKY_TILES];
+                        tile = std::max(tile, uint8_t(clearFrom));
+                    }
+                }
+            }
+        }
+    }
+
+    // True if a rising ray from `pos`, in cell (x, y, z), passes over
+    // everything: raycast would step through empty cells until it is above the
+    // world or outside it. Never true for a ray that could hit something: the
+    // start tile is tested with the ray's own cell, the others with the height
+    // at which the ray enters them, less a margin far larger than the rounding
+    // of either march.
+    bool skyAhead(const Vec3& pos, const Vec3& dir, int x, int y, int z) const {
+        int tx = x >> SKY_SHIFT, tz = z >> SKY_SHIFT;
+        if (y < int(skyTiles[tx + size_t(tz) * SKY_TILES])) return false;
+        const int stepX = dir.x > 0 ? 1 : -1, stepZ = dir.z > 0 ? 1 : -1;
+        float tMaxX = (dir.x != 0) ? (float((tx + (stepX > 0 ? 1 : 0)) << SKY_SHIFT) - pos.x) / dir.x : 1e30f;
+        float tMaxZ = (dir.z != 0) ? (float((tz + (stepZ > 0 ? 1 : 0)) << SKY_SHIFT) - pos.z) / dir.z : 1e30f;
+        const float tDeltaX = (dir.x != 0) ? float(stepX * SKY_TILE) / dir.x : 1e30f;
+        const float tDeltaZ = (dir.z != 0) ? float(stepZ * SKY_TILE) / dir.z : 1e30f;
+        const float aboveAll = float(topY + 1);
+        for (;;) {
+            float t;
+            if (tMaxX < tMaxZ) {
+                t = tMaxX; tMaxX += tDeltaX; tx += stepX;
+                if (tx < 0 || tx >= SKY_TILES) return true;
+            } else {
+                t = tMaxZ; tMaxZ += tDeltaZ; tz += stepZ;
+                if (tz < 0 || tz >= SKY_TILES) return true;
+            }
+            float height = pos.y + dir.y * t - 0.1f;
+            if (height >= aboveAll) return true;
+            if (!(height >= float(skyTiles[tx + size_t(tz) * SKY_TILES]))) return false;
+        }
+    }
+
     void buildLightCells() {
         const float LIGHT_RANGE = 28.0f;
         lights.clear();
@@ -1768,6 +1829,7 @@ public:
         const int yEnd = stepY > 0 ? WORLD_HEIGHT : -1;
         const int zEnd = stepZ > 0 ? WORLD_SIZE : -1;
         bool aboveTop = stepY > 0 && y > topY;      // rising above every block: open sky
+        if (stepY > 0 && !startedInWater && skyAhead(pos, dir, x, y, z)) return false;
         auto hit = [&](BlockType block) {
             hitPos = pos + dir * dist;
             hitBlock = block;
@@ -2493,6 +2555,79 @@ inline Vec3 causticColor(float x, float z, float depth, const SunLight& sun) {
                 causticAt(x + hx * shift, z + hz * shift, depth));
 }
 
+// The phase function shared by both versions below: how much of the sunlight
+// passing a point is scattered toward the eye
+inline float volumetricPhase(const Ray& ray, const SunLight& sun, bool inWater) {
+    float cosTheta = ray.direction.dot(inWater ? -sun.refracted : -sun.direction);
+    // Water scatters less sharply forward than haze, so shafts also show from the side
+    float g = inWater ? 0.5f : 0.6f;
+    return (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
+}
+
+// calculateVolumetrics for a ray the camera does not see directly: one of the
+// 12 steps, chosen at random and scaled by 12. The same arithmetic as the
+// full version would do for that step, without the arrays for the other eleven.
+Vec3 volumetricsOneStep(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater) {
+    const int numSamples = 12;
+    const int firstStep = std::min(numSamples - 1, int(random01() * numSamples));
+    float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
+    Vec3 toSun = -sun.direction;
+    const bool useBands = world.sunBandsFor(toSun, World::SUN_SHADOW_REACH);
+
+    float t = stepSize * (firstStep + random01() * 0.5f);
+    Vec3 samplePos = ray.at(t);
+    int cx = static_cast<int>(std::floor(samplePos.x));
+    int cy = static_cast<int>(std::floor(samplePos.y));
+    int cz = static_cast<int>(std::floor(samplePos.z));
+    unsigned info = 0;                                  // outside the world: air, to be marched
+    const bool inside = World::inWorld(cx, cy, cz);
+    if (inside) {
+        if (useBands) {
+            info = world.sunBandAt(cx, cy, cz, samplePos.x, samplePos.y, samplePos.z);
+        } else {
+            uint8_t cell = world.gridFor(toSun)[World::cellIndex(cx, cy, cz)];
+            info = ((cell & ~World::SUN_CLEAR) == WATER ? 4u : 0u) | ((cell & World::SUN_CLEAR) ? 1u : 0u);
+        }
+    }
+    if (((info & 4) != 0) != inWater) return Vec3(0, 0, 0);     // the step is outside this ray's medium
+    float visible;
+    if (info & 3) {
+        t_rayCount++;                                   // settled by the table; still one ray
+        visible = (info & 3) == 1 ? 1.0f : (info & 3) == 2 ? 0.3f : 0.0f;
+    } else {
+        uint8_t block = useBands && inside
+            ? world.sunMarch(samplePos.x, samplePos.y, samplePos.z, toSun, World::SUN_SHADOW_REACH)
+            : world.shadowBlock(samplePos, toSun, World::SUN_SHADOW_REACH);
+        visible = block == AIR ? 1.0f : block == LEAVES ? 0.3f : 0.0f;
+    }
+    if (!(visible > 0.0f)) return Vec3(0, 0, 0);
+    const float scaleUp = float(numSamples);
+    float phase = volumetricPhase(ray, sun, inWater);
+
+    if (inWater) {
+        const float invDown = 1.0f / std::max(0.05f, -sun.refracted.y);
+        float depth = std::max(0.0f, float(WATER_LEVEL) - samplePos.y);
+        float light = visible * causticAt(samplePos.x, samplePos.z, depth);
+        Vec3 sum(0, 0, 0);
+        sum += waterTransmittance(depth * invDown + t) * light;
+        return sun.getLightContribution() * sum *
+               (scaleUp * sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize *
+                g_settings.shaftStrength);
+    }
+
+    // Air: haze that thins with height. Both exponentials in one call.
+    alignas(32) float e[8] = {(samplePos.y - 10.0f) * -0.02f, t * -0.01f, 0, 0, 0, 0, 0, 0};
+    exp8(F8::load(e)).store(e);
+    float li = visible * sun.intensity;
+    float att = 0.1f > e[0] ? 0.1f : e[0];              // as max8 and min8 do it
+    att = 1.0f < att ? 1.0f : att;
+    float total = li * att * e[1];
+    total *= scaleUp;
+    float timeStrength = 1.0f + 2.0f * (1.0f - std::abs(g_settings.timeOfDay - 0.5f) * 2.0f);
+    Vec3 volumetricLight = sun.color * (total * 0.04f * phase * stepSize);
+    return volumetricLight * Vec3(1.0f, 0.95f, 0.9f) * (timeStrength * 3.0f);
+}
+
 // Calculate volumetrics: sunlight scattered toward the eye along a ray. Each
 // sample asks whether it sees the sun. The sun band table answers most of them
 // (World::classifySunBands); the rest are marched, as SIMD packets
@@ -2509,10 +2644,9 @@ inline Vec3 causticColor(float x, float z, float depth, const SunLight& sun) {
 Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, const SunLight& sun, bool inWater,
                           bool fullQuality) {
     if (!g_settings.enableVolumetrics) return Vec3(0, 0, 0);
+    if (!fullQuality) return volumetricsOneStep(ray, maxDist, world, sun, inWater);
 
     const int numSamples = 12;
-    const int evaluated = fullQuality ? numSamples : 1;
-    const int firstStep = fullQuality ? 0 : std::min(numSamples - 1, int(random01() * numSamples));
     // Water is murkier than air, so its shafts are sampled over a shorter stretch
     float stepSize = std::min(maxDist, inWater ? 20.0f : 50.0f) / float(numSamples);
 
@@ -2523,11 +2657,11 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     Vec3 toSun = -sun.direction;
     const uint8_t* sunGrid = world.gridFor(toSun);
     const bool useBands = world.sunBandsFor(toSun, World::SUN_SHADOW_REACH);
-    const int groups = (evaluated + 7) / 8;
+    const int groups = (numSamples + 7) / 8;
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
     alignas(32) float visible[16];
     bool needsMarch[16];        // the sample's view of the sun has to be traced
-    for (int i = evaluated; i < groups * 8; i++) {      // pad the last group of 8
+    for (int i = numSamples; i < groups * 8; i++) {     // pad the last group of 8
         ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
         visible[i] = 0;
         needsMarch[i] = false;
@@ -2536,8 +2670,8 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     int marching[2] = {0, 0};
     int marchingOutside = 0;
     int settledRays = 0;
-    for (int i = 0; i < evaluated; i++) {
-        float t = stepSize * (firstStep + i + random01() * 0.5f);
+    for (int i = 0; i < numSamples; i++) {
+        float t = stepSize * (i + random01() * 0.5f);
         Vec3 samplePos = ray.at(t);
         ts[i] = t;
         sx[i] = samplePos.x;
@@ -2556,7 +2690,7 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
                 uint8_t cell = sunGrid[World::cellIndex(cx, cy, cz)];
                 info = ((cell & ~World::SUN_CLEAR) == WATER ? 4u : 0u) | ((cell & World::SUN_CLEAR) ? 1u : 0u);
             }
-        } else if (evaluated != 1 && !World::laneMayEnter(cx, cy, cz, toSun)) {
+        } else if (!World::laneMayEnter(cx, cy, cz, toSun)) {
             info = 1;                                   // a march from here ends after one step, in the open
         }
         const bool active = ((info & 4) != 0) == inWater;       // the sample is in this ray's medium
@@ -2572,77 +2706,56 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
 
     auto seenThrough = [](uint8_t block) { return block == AIR ? 1.0f : block == LEAVES ? 0.3f : 0.0f; };
     const bool laneByLane = useBands && marchingOutside == 0;   // what sunMarch needs
-    if (evaluated == 1) {
-        // A packet with one live lane costs almost a full packet; use a plain ray.
-        if (marching[0]) {
-            visible[0] = seenThrough(laneByLane
-                ? world.sunMarch(sx[0], sy[0], sz[0], toSun, World::SUN_SHADOW_REACH)
-                : world.shadowBlock(Vec3(sx[0], sy[0], sz[0]), toSun, World::SUN_SHADOW_REACH));
-        }
-    } else {
-        const Vec3 laneDir = toSun.normalize();
-        for (int group = 0; group < groups; group++) {
-            if (!marching[group]) continue;
-            int base = group * 8;
-            // A lane or two: one at a time is quicker than a packet that is mostly idle
-            if (laneByLane && marching[group] <= 2) {
-                for (int L = 0; L < 8; L++) {
-                    if (needsMarch[base + L]) {
-                        visible[base + L] = seenThrough(world.sunMarch(sx[base + L], sy[base + L], sz[base + L],
-                                                                       laneDir, World::SUN_SHADOW_REACH));
-                    }
-                }
-                continue;
-            }
-            uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            world.raycastShadow8(sx + base, sy + base, sz + base, toSun, World::SUN_SHADOW_REACH,
-                                 needsMarch + base, hitBlock);
+    const Vec3 laneDir = toSun.normalize();
+    for (int group = 0; group < groups; group++) {
+        if (!marching[group]) continue;
+        int base = group * 8;
+        // A lane or two: one at a time is quicker than a packet that is mostly idle
+        if (laneByLane && marching[group] <= 2) {
             for (int L = 0; L < 8; L++) {
-                if (needsMarch[base + L]) visible[base + L] = seenThrough(hitBlock[L]);
+                if (needsMarch[base + L]) {
+                    visible[base + L] = seenThrough(world.sunMarch(sx[base + L], sy[base + L], sz[base + L],
+                                                                   laneDir, World::SUN_SHADOW_REACH));
+                }
             }
+            continue;
+        }
+        uint8_t hitBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        world.raycastShadow8(sx + base, sy + base, sz + base, toSun, World::SUN_SHADOW_REACH,
+                             needsMarch + base, hitBlock);
+        for (int L = 0; L < 8; L++) {
+            if (needsMarch[base + L]) visible[base + L] = seenThrough(hitBlock[L]);
         }
     }
     bool anyVisible = false;
-    for (int i = 0; i < evaluated; i++) anyVisible = anyVisible || visible[i] > 0.0f;
+    for (int i = 0; i < numSamples; i++) anyVisible = anyVisible || visible[i] > 0.0f;
     // No sample sees the sun: every term below would be multiplied by zero
     if (!anyVisible) return Vec3(0, 0, 0);
-    const float scaleUp = float(numSamples) / float(evaluated);
-
-    float cosTheta = ray.direction.dot(inWater ? -sun.refracted : -sun.direction);
-    // Water scatters less sharply forward than haze, so shafts also show from the side
-    float g = inWater ? 0.5f : 0.6f;
-    float phase = (1.0f - g * g) / (4.0f * M_PI * std::pow(1.0f + g * g - 2.0f * g * cosTheta, 1.5f));
+    float phase = volumetricPhase(ray, sun, inWater);
 
     if (inWater) {
         const float invDown = 1.0f / std::max(0.05f, -sun.refracted.y);
         // Sun to each sample (slanted path down), then sample to the eye: the
         // light that survives, per color.
         Vec3 sum(0, 0, 0);
-        if (evaluated == 1) {
-            float depth = std::max(0.0f, float(WATER_LEVEL) - sy[0]);
-            float light = visible[0] * causticAt(sx[0], sz[0], depth);
-            sum += waterTransmittance(depth * invDown + ts[0]) * light;
-        } else {
-            // All samples go through exp8 together, one color at a time
-            alignas(32) float tr[3][16];
-            float depths[16];
-            for (int i = 0; i < groups * 8; i++) {
-                depths[i] = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
-                float path = visible[i] > 0.0f ? depths[i] * invDown + ts[i] : 0.0f;
-                for (int c = 0; c < 3; c++) tr[c][i] = -WATER_EXTINCTION[c] * path;
-            }
-            for (int c = 0; c < 3; c++) {
-                for (int group = 0; group < groups; group++) exp8(F8::load(tr[c] + group * 8)).store(tr[c] + group * 8);
-            }
-            for (int i = 0; i < evaluated; i++) {
-                if (visible[i] <= 0.0f) continue;
-                float light = visible[i] * causticAt(sx[i], sz[i], depths[i]);
-                sum += Vec3(tr[0][i], tr[1][i], tr[2][i]) * light;
-            }
+        // All samples go through exp8 together, one color at a time
+        alignas(32) float tr[3][16];
+        float depths[16];
+        for (int i = 0; i < groups * 8; i++) {
+            depths[i] = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
+            float path = visible[i] > 0.0f ? depths[i] * invDown + ts[i] : 0.0f;
+            for (int c = 0; c < 3; c++) tr[c][i] = -WATER_EXTINCTION[c] * path;
+        }
+        for (int c = 0; c < 3; c++) {
+            for (int group = 0; group < groups; group++) exp8(F8::load(tr[c] + group * 8)).store(tr[c] + group * 8);
+        }
+        for (int i = 0; i < numSamples; i++) {
+            if (visible[i] <= 0.0f) continue;
+            float light = visible[i] * causticAt(sx[i], sz[i], depths[i]);
+            sum += Vec3(tr[0][i], tr[1][i], tr[2][i]) * light;
         }
         return sun.getLightContribution() * sum *
-               (scaleUp * sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize *
-                g_settings.shaftStrength);
+               (sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize * g_settings.shaftStrength);
     }
 
     // Air: haze that thins with height
@@ -2655,7 +2768,6 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         F8 absorption = exp8(F8::load(ts + base) * F8(-0.01f));
         total += hsum8(li * att * absorption);
     }
-    total *= scaleUp;
     float timeStrength = 1.0f + 2.0f * (1.0f - std::abs(g_settings.timeOfDay - 0.5f) * 2.0f);
     Vec3 volumetricLight = sun.color * (total * 0.04f * phase * stepSize);
     return volumetricLight * Vec3(1.0f, 0.95f, 0.9f) * (timeStrength * 3.0f);
@@ -2665,6 +2777,47 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
 // block of water holds a few of them at hashed positions; a ray picks up the
 // ones it passes close to. Only the first stretch of a ray is checked, and
 // only for a camera that is itself under water.
+//
+// A block's specks depend only on the block and the time, and the rays of a
+// frame keep passing through the same blocks near the camera, so each thread
+// keeps the ones it has worked out (SpeckCache) instead of repeating the
+// hashes and sines for every ray.
+struct Speck {
+    float rest[3];          // where it sits
+    float drifted[3];       // where it is now
+    float radius;
+};
+struct SpeckCache {
+    static constexpr int SLOTS = 2048;      // by the low bits of the block's position
+    struct Slot {
+        int x = 0, y = -1, z = 0;           // y = -1: empty (specks are only looked up in water, y >= 0)
+        float time = 0.0f;
+        Speck speck[3];
+    };
+    std::vector<Slot> slots = std::vector<Slot>(SLOTS);
+
+    const Speck* in(int x, int y, int z, float time) {
+        Slot& slot = slots[(x & 15) | ((z & 15) << 4) | ((y & 7) << 8)];
+        if (slot.x != x || slot.y != y || slot.z != z || slot.time != time) {
+            slot.x = x; slot.y = y; slot.z = z; slot.time = time;
+            for (uint32_t k = 0; k < 3; k++) {
+                uint32_t h = hashCell(x, y, z, 0x51ed270bU + k);
+                Vec3 p(x + hashFloat(h), y + hashFloat(hash32(h + 1)), z + hashFloat(hash32(h + 2)));
+                Speck& speck = slot.speck[k];
+                speck.rest[0] = p.x; speck.rest[1] = p.y; speck.rest[2] = p.z;
+                // Slow drift
+                float ph = hashFloat(hash32(h + 3)) * 6.2831853f;
+                p = p + Vec3(0.12f * std::sin(time * 0.35f + ph), 0.08f * std::sin(time * 0.27f + ph * 1.7f),
+                             0.12f * std::cos(time * 0.31f + ph));
+                speck.drifted[0] = p.x; speck.drifted[1] = p.y; speck.drifted[2] = p.z;
+                speck.radius = 0.0015f + 0.0035f * hashFloat(hash32(h + 4));
+            }
+        }
+        return slot.speck;
+    }
+};
+thread_local SpeckCache t_specks;
+
 Vec3 waterParticles(const Ray& ray, float maxDist, const World& world, const SunLight& sun) {
     const float reach = std::min(maxDist, 10.0f);
     const float pixel = 2.0f * std::tan(FOV * float(M_PI) / 360.0f) / float(g_settings.renderHeight);
@@ -2687,23 +2840,21 @@ Vec3 waterParticles(const Ray& ray, float maxDist, const World& world, const Sun
     float dist = 0.0f;
     while (dist < reach) {
         if (y < WATER_LEVEL && world.getBlock(x, y, z) == WATER) {
-            for (uint32_t k = 0; k < 3; k++) {
-                uint32_t h = hashCell(x, y, z, 0x51ed270bU + k);
-                Vec3 p(x + hashFloat(h), y + hashFloat(hash32(h + 1)), z + hashFloat(hash32(h + 2)));
+            const Speck* specks = t_specks.in(x, y, z, time);
+            for (int k = 0; k < 3; k++) {
+                const Speck& speck = specks[k];
+                Vec3 p(speck.rest[0], speck.rest[1], speck.rest[2]);
                 Vec3 v = p - o;
                 float t = v.dot(dir);
                 if (t < 0.6f || t > reach + 0.5f) continue;
                 if (v.dot(v) - t * t > 0.09f) continue;                 // not near the ray, even after drifting
-                // Slow drift
-                float ph = hashFloat(hash32(h + 3)) * 6.2831853f;
-                p = p + Vec3(0.12f * std::sin(time * 0.35f + ph), 0.08f * std::sin(time * 0.27f + ph * 1.7f),
-                             0.12f * std::cos(time * 0.31f + ph));
+                p = Vec3(speck.drifted[0], speck.drifted[1], speck.drifted[2]);
                 if (p.y > float(WATER_LEVEL) - 0.05f) continue;
                 v = p - o;
                 t = v.dot(dir);
                 if (t < 0.6f || t > reach) continue;
                 float perp2 = std::max(0.0f, v.dot(v) - t * t);
-                float radius = 0.0015f + 0.0035f * hashFloat(hash32(h + 4));
+                float radius = speck.radius;
                 float foot = 0.6f * pixel * t;                          // about half a pixel at that distance
                 float r2 = radius * radius + foot * foot;
                 if (perp2 > 6.0f * r2) continue;

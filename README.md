@@ -111,14 +111,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.50 | 426 |
-| shore | 0.48 | 466 |
-| underwater | 0.69 | 298 |
-| lakebed | 0.58 | 490 |
-| aerial | 0.44 | 476 |
-| deep | 0.72 | 277 |
-| lookup | 0.71 | 352 |
-| total | 4.12 | 385 |
+| lake | 0.49 | 430 |
+| shore | 0.46 | 492 |
+| underwater | 0.61 | 338 |
+| lakebed | 0.56 | 509 |
+| aerial | 0.43 | 485 |
+| deep | 0.63 | 316 |
+| lookup | 0.64 | 392 |
+| total | 3.82 | 415 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -216,6 +216,11 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   marching; where a band's edges split around a block, the ray is marched as before, so
   the picture is byte-identical. The table settles about 99% of the points in open cells
   (fewer with the sun almost overhead) and is rebuilt in 15 to 30 ms when the sun moves
+- Open sky: the world's columns are grouped in tiles of 4 x 4 with the height above which
+  each tile is empty. A rising ray is first walked over the tiles; if it stays above every
+  one it crosses it ends there, without a march through the cells
+- Indirect bounces evaluate their one light-shaft step in a short path of its own, and the
+  specks drifting in the water are worked out once per block and thread instead of per ray
 - Persistent worker threads for render passes, image conversion and the caustic map; the
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
