@@ -111,14 +111,14 @@ Measured with `--bench` (640x360, 32 samples per pixel) on an AMD Ryzen 9 7950X
 
 | View | Time (s) | Mrays/s |
 |---|---|---|
-| lake | 0.49 | 430 |
-| shore | 0.46 | 492 |
-| underwater | 0.61 | 338 |
-| lakebed | 0.56 | 509 |
-| aerial | 0.43 | 485 |
-| deep | 0.63 | 316 |
-| lookup | 0.64 | 392 |
-| total | 3.82 | 415 |
+| lake | 0.46 | 459 |
+| shore | 0.42 | 536 |
+| underwater | 0.56 | 371 |
+| lakebed | 0.53 | 535 |
+| aerial | 0.41 | 504 |
+| deep | 0.58 | 342 |
+| lookup | 0.57 | 438 |
+| total | 3.53 | 448 |
 
 Renders are repeatable: random numbers are seeded per pixel, pass and frame, so
 the same command gives a byte-identical image on any number of threads. To check
@@ -227,6 +227,8 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   one it crosses it ends there, without a march through the cells
 - Indirect bounces evaluate their one light-shaft step in a short path of its own, and the
   specks drifting in the water are worked out once per block and thread instead of per ray
+- The twelve light-shaft samples of a camera ray are set up eight at a time: positions,
+  the sun band lookup and, under water, the absorption and the caustic map
 - Persistent worker threads for render passes, image conversion and the caustic map; the
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by

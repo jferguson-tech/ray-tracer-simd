@@ -1465,7 +1465,8 @@ public:
         sunBandRise = riseIn;
         sunBandBase = static_cast<float>(base);
         sunBandPerUnit = static_cast<float>(1.0 / width);
-        sunBandFirst.resize(size_t(WORLD_SIZE) * WORLD_HEIGHT);
+        // One spare entry each: sunBandAt8 reads these tables four bytes at a time
+        sunBandFirst.resize(size_t(WORLD_SIZE) * WORLD_HEIGHT + 1);
         for (int i = 0; i < WORLD_SIZE; i++) {
             for (int y = 0; y < WORLD_HEIGHT; y++) {
                 sunBandFirst[size_t(i) * WORLD_HEIGHT + y] =
@@ -1475,8 +1476,8 @@ public:
 
         // Every cell's word before any band is entered, and the column table
         const int threads = std::min(renderThreadCount(), WORLD_SIZE);
-        sunBands.resize(blocks.size());
-        sunColumns.resize(size_t(WORLD_SIZE) * WORLD_SIZE);
+        sunBands.resize(blocks.size() + 1);
+        sunColumns.resize(size_t(WORLD_SIZE) * WORLD_SIZE + 1);
         g_pool.run(threads, [&](int t) {
             const int zBegin = int(int64_t(WORLD_SIZE) * t / threads);
             const int zEnd = int(int64_t(WORLD_SIZE) * (t + 1) / threads);
@@ -1581,6 +1582,44 @@ public:
         const int slot = std::min(6, std::max(0, band - sunBandFirst[size_t(column) * WORLD_HEIGHT + cy]));
         const unsigned word = sunBands[cellIndex(cx, cy, cz)];
         return ((word >> 15) << 2) | ((word >> (2 * slot)) & 3);
+    }
+
+    // sunBandAt for eight points at once, all of them inside the world
+    inline __m256i sunBandAt8(__m256i cx, __m256i cy, __m256i cz, __m256 px, __m256 py, __m256 pz) const {
+        const __m256i low16 = _mm256_set1_epi32(0xFFFF);
+        const __m256i column = _mm256_add_epi32(cx, _mm256_slli_epi32(cz, 9));
+        static_assert(WORLD_SIZE == 512, "the shift above is log2(WORLD_SIZE)");
+        const __m256i columnInfo = _mm256_and_si256(
+            _mm256_i32gather_epi32(reinterpret_cast<const int*>(sunColumns.data()), column, 2), low16);
+        const __m256i below = _mm256_cmpgt_epi32(_mm256_and_si256(columnInfo, _mm256_set1_epi32(0xFF)), cy);
+        const __m256i inWater = _mm256_cmpgt_epi32(_mm256_srli_epi32(columnInfo, 8), cy);
+        __m256i info = _mm256_or_si256(_mm256_set1_epi32(1), _mm256_and_si256(inWater, _mm256_set1_epi32(4)));
+        if (_mm256_testz_si256(below, below)) return info;     // all above everything that could shade them
+
+        // The others: the cell's word, and the band the point is in
+        const __m256 along = sunBandAlongX ? px : pz;
+        const __m256i cell = sunBandAlongX ? cx : cz;
+        const __m256 u = sunBandStep > 0 ? along : _mm256_sub_ps(_mm256_set1_ps(float(WORLD_SIZE)), along);
+        const __m256i alongColumn = sunBandStep > 0 ? cell : _mm256_sub_epi32(_mm256_set1_epi32(WORLD_SIZE - 1), cell);
+        const __m256 c = _mm256_sub_ps(py, _mm256_mul_ps(_mm256_set1_ps(sunBandRise), u));
+        const __m256i band = _mm256_cvttps_epi32(
+            _mm256_mul_ps(_mm256_sub_ps(c, _mm256_set1_ps(sunBandBase)), _mm256_set1_ps(sunBandPerUnit)));
+        const __m256i firstIndex = _mm256_add_epi32(_mm256_mullo_epi32(alongColumn, _mm256_set1_epi32(WORLD_HEIGHT)), cy);
+        __m256i first = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(),
+                                                    reinterpret_cast<const int*>(sunBandFirst.data()), firstIndex, below, 2);
+        first = _mm256_srai_epi32(_mm256_slli_epi32(first, 16), 16);
+        const __m256i slot = _mm256_min_epi32(_mm256_set1_epi32(6),
+                                              _mm256_max_epi32(_mm256_setzero_si256(), _mm256_sub_epi32(band, first)));
+        const __m256i idx = _mm256_add_epi32(cx, _mm256_add_epi32(
+            _mm256_mullo_epi32(cy, _mm256_set1_epi32(WORLD_SIZE)),
+            _mm256_mullo_epi32(cz, _mm256_set1_epi32(WORLD_SIZE * WORLD_HEIGHT))));
+        const __m256i word = _mm256_and_si256(
+            _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), reinterpret_cast<const int*>(sunBands.data()), idx, below, 2),
+            low16);
+        const __m256i banded = _mm256_or_si256(
+            _mm256_slli_epi32(_mm256_srli_epi32(word, 15), 2),
+            _mm256_and_si256(_mm256_srlv_epi32(word, _mm256_slli_epi32(slot, 1)), _mm256_set1_epi32(3)));
+        return _mm256_blendv_epi8(info, banded, below);
     }
 
     // Can a packet lane that starts in this cell, outside the world, get in?
@@ -2492,6 +2531,55 @@ private:
         return la * (1 - td) + lb * td;
     }
 
+public:
+    // sample() for eight points at once; only the lanes set in `wanted` are read
+    __m256 sample8(__m256 x, __m256 z, __m256 depth, __m256 wanted) const {
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 dx = _mm256_sub_ps(x, _mm256_set1_ps(centerX)), dz = _mm256_sub_ps(z, _mm256_set1_ps(centerZ));
+        const __m256 dist2 = _mm256_add_ps(_mm256_mul_ps(dx, dx), _mm256_mul_ps(dz, dz));
+        const __m256 within = _mm256_and_ps(wanted, _mm256_cmp_ps(dist2, _mm256_set1_ps(FADE_END * FADE_END), _CMP_LT_OQ));
+        if (_mm256_testz_ps(within, within)) return one;
+        const __m256 value = lookup8(_mm256_sub_ps(x, _mm256_set1_ps(float(originX))),
+                                     _mm256_sub_ps(z, _mm256_set1_ps(float(originZ))), depth, within);
+        const __m256 full = _mm256_cmp_ps(dist2, _mm256_set1_ps(FADE_START * FADE_START), _CMP_LE_OQ);
+        const __m256 keep = _mm256_div_ps(_mm256_sub_ps(_mm256_set1_ps(FADE_END), _mm256_sqrt_ps(dist2)),
+                                          _mm256_set1_ps(FADE_END - FADE_START));
+        const __m256 faded = _mm256_add_ps(one, _mm256_mul_ps(_mm256_sub_ps(value, one), keep));
+        return _mm256_blendv_ps(one, _mm256_blendv_ps(faded, value, full), within);
+    }
+
+private:
+    // lookup() for eight points at once
+    __m256 lookup8(__m256 x, __m256 z, __m256 depth, __m256 wanted) const {
+        const __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f), half = _mm256_set1_ps(0.5f);
+        const __m256 fd = _mm256_min_ps(_mm256_max_ps(depth, zero), _mm256_set1_ps(float(LAYERS - 1)));
+        const __m256i d0 = _mm256_min_epi32(_mm256_set1_epi32(LAYERS - 2), _mm256_cvttps_epi32(fd));
+        const __m256 td = _mm256_sub_ps(fd, _mm256_cvtepi32_ps(d0));
+        const __m256 scale = _mm256_set1_ps(float(res)), last = _mm256_set1_ps(float(size - 1));
+        const __m256 fx = _mm256_min_ps(_mm256_max_ps(_mm256_sub_ps(_mm256_mul_ps(x, scale), half), zero), last);
+        const __m256 fz = _mm256_min_ps(_mm256_max_ps(_mm256_sub_ps(_mm256_mul_ps(z, scale), half), zero), last);
+        const __m256i ix = _mm256_min_epi32(_mm256_set1_epi32(size - 2), _mm256_cvttps_epi32(fx));
+        const __m256i iz = _mm256_min_epi32(_mm256_set1_epi32(size - 2), _mm256_cvttps_epi32(fz));
+        const __m256 tx = _mm256_sub_ps(fx, _mm256_cvtepi32_ps(ix)), tz = _mm256_sub_ps(fz, _mm256_cvtepi32_ps(iz));
+        const __m256 ux = _mm256_sub_ps(one, tx), uz = _mm256_sub_ps(one, tz);
+        const __m256i sizes = _mm256_set1_epi32(size);
+        const __m256i index = _mm256_add_epi32(
+            _mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(d0, sizes), iz), sizes), ix);
+        const float* a = data.data();
+        const float* b = a + size_t(size) * size;
+        auto bilinear = [&](const float* layer) {
+            const __m256 v00 = _mm256_mask_i32gather_ps(zero, layer, index, wanted, 4);
+            const __m256 v01 = _mm256_mask_i32gather_ps(zero, layer + 1, index, wanted, 4);
+            const __m256 v10 = _mm256_mask_i32gather_ps(zero, layer + size, index, wanted, 4);
+            const __m256 v11 = _mm256_mask_i32gather_ps(zero, layer + size + 1, index, wanted, 4);
+            return _mm256_add_ps(
+                _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(v00, ux), _mm256_mul_ps(v01, tx)), uz),
+                _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(v10, ux), _mm256_mul_ps(v11, tx)), tz));
+        };
+        const __m256 la = bilinear(a), lb = bilinear(b);
+        return _mm256_add_ps(_mm256_mul_ps(la, _mm256_sub_ps(one, td)), _mm256_mul_ps(lb, td));
+    }
+
     // Splits 0 .. count-1 into one contiguous range per thread
     template <typename Fn>
     static void runParallel(int count, int threads, Fn fn) {
@@ -2541,6 +2629,14 @@ inline float causticAt(float x, float z, float depth) {
     if (!g_settings.enableCaustics || !g_caustics.ready()) return 1.0f;
     float c = g_caustics.sample(x, z, depth);
     return std::max(0.0f, 1.0f + (c - 1.0f) * g_settings.causticStrength);
+}
+
+// causticAt for eight points at once; lanes not set in `wanted` are not read
+// and their result is not meaningful
+inline F8 causticAt8(F8 x, F8 z, F8 depth, F8 wanted) {
+    if (!g_settings.enableCaustics || !g_caustics.ready()) return F8(1.0f);
+    F8 c(g_caustics.sample8(x.v, z.v, depth.v, wanted.v));
+    return F8(_mm256_max_ps((F8(1.0f) + (c - F8(1.0f)) * F8(g_settings.causticStrength)).v, _mm256_setzero_ps()));
 }
 
 // The same per color. Water bends blue slightly more than red, so the three
@@ -2661,46 +2757,77 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
     alignas(32) float ts[16], sx[16], sy[16], sz[16];
     alignas(32) float visible[16];
     bool needsMarch[16];        // the sample's view of the sun has to be traced
-    for (int i = numSamples; i < groups * 8; i++) {     // pad the last group of 8
-        ts[i] = 0; sx[i] = 0; sy[i] = 0; sz[i] = 0;
-        visible[i] = 0;
-        needsMarch[i] = false;
-    }
-    static const float SEEN[4] = {0.0f, 1.0f, 0.3f, 0.0f};      // by what the table says (see sunBandAt)
+    alignas(32) float jitter[16] = {};
+    for (int i = 0; i < numSamples; i++) jitter[i] = random01();
     int marching[2] = {0, 0};
     int marchingOutside = 0;
     int settledRays = 0;
-    for (int i = 0; i < numSamples; i++) {
-        float t = stepSize * (i + random01() * 0.5f);
-        Vec3 samplePos = ray.at(t);
-        ts[i] = t;
-        sx[i] = samplePos.x;
-        sy[i] = samplePos.y;
-        sz[i] = samplePos.z;
-        int cx = static_cast<int>(std::floor(samplePos.x));
-        int cy = static_cast<int>(std::floor(samplePos.y));
-        int cz = static_cast<int>(std::floor(samplePos.z));
-        unsigned info = 0;                              // outside the world: air, to be marched
-        const bool inside = World::inWorld(cx, cy, cz);
-        if (inside) {
-            if (useBands) {
-                info = world.sunBandAt(cx, cy, cz, samplePos.x, samplePos.y, samplePos.z);
-            } else {
-                // No table for this direction: the grid's flag settles the cells above everything
-                uint8_t cell = sunGrid[World::cellIndex(cx, cy, cz)];
-                info = ((cell & ~World::SUN_CLEAR) == WATER ? 4u : 0u) | ((cell & World::SUN_CLEAR) ? 1u : 0u);
+    // Eight samples at a time; the lanes past the last sample stay zero
+    const __m256 seen = _mm256_setr_ps(0.0f, 1.0f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);    // by what the table says (see sunBandAt)
+    const __m256i mediumIsWater = _mm256_set1_epi32(inWater ? -1 : 0);
+    for (int group = 0; group < groups; group++) {
+        const int base = group * 8;
+        const int lanes = std::min(8, numSamples - base);
+        const __m256i real = _mm256_cmpgt_epi32(_mm256_set1_epi32(lanes), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+        const __m256 realPs = _mm256_castsi256_ps(real);
+        const F8 number(_mm256_setr_ps(base + 0.0f, base + 1.0f, base + 2.0f, base + 3.0f,
+                                       base + 4.0f, base + 5.0f, base + 6.0f, base + 7.0f));
+        const F8 t = and8(F8(stepSize) * (number + F8::load(jitter + base) * F8(0.5f)), F8(realPs));
+        const F8 px = and8(F8(ray.origin.x) + F8(ray.direction.x) * t, F8(realPs));
+        const F8 py = and8(F8(ray.origin.y) + F8(ray.direction.y) * t, F8(realPs));
+        const F8 pz = and8(F8(ray.origin.z) + F8(ray.direction.z) * t, F8(realPs));
+        t.store(ts + base);
+        px.store(sx + base);
+        py.store(sy + base);
+        pz.store(sz + base);
+        const __m256i cx = _mm256_cvttps_epi32(floor8(px).v);
+        const __m256i cy = _mm256_cvttps_epi32(floor8(py).v);
+        const __m256i cz = _mm256_cvttps_epi32(floor8(pz).v);
+        const __m256i minusOne = _mm256_set1_epi32(-1);
+        const __m256i sizeXZ = _mm256_set1_epi32(WORLD_SIZE);
+        const __m256i inside = _mm256_and_si256(
+            _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(cx, minusOne), _mm256_cmpgt_epi32(sizeXZ, cx)),
+                             _mm256_and_si256(_mm256_cmpgt_epi32(cz, minusOne), _mm256_cmpgt_epi32(sizeXZ, cz))),
+            _mm256_and_si256(_mm256_cmpgt_epi32(cy, minusOne), _mm256_cmpgt_epi32(_mm256_set1_epi32(WORLD_HEIGHT), cy)));
+        // Bits 0-1: what a ray toward the sun finds (as sunBandAt); bit 2: the sample is in water
+        __m256i info;
+        if (useBands && _mm256_movemask_ps(_mm256_castsi256_ps(inside)) == 0xFF) {
+            info = world.sunBandAt8(cx, cy, cz, px.v, py.v, pz.v);
+        } else {
+            alignas(32) int cellX[8], cellY[8], cellZ[8], infos[8] = {};
+            _mm256_store_si256(reinterpret_cast<__m256i*>(cellX), cx);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(cellY), cy);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(cellZ), cz);
+            for (int L = 0; L < lanes; L++) {
+                unsigned found = 0;                             // outside the world: air, to be marched
+                if (World::inWorld(cellX[L], cellY[L], cellZ[L])) {
+                    if (useBands) {
+                        found = world.sunBandAt(cellX[L], cellY[L], cellZ[L], sx[base + L], sy[base + L], sz[base + L]);
+                    } else {
+                        // No table for this direction: the grid's flag settles the cells above everything
+                        uint8_t cell = sunGrid[World::cellIndex(cellX[L], cellY[L], cellZ[L])];
+                        found = ((cell & ~World::SUN_CLEAR) == WATER ? 4u : 0u) | ((cell & World::SUN_CLEAR) ? 1u : 0u);
+                    }
+                } else if (!World::laneMayEnter(cellX[L], cellY[L], cellZ[L], toSun)) {
+                    found = 1;                                  // a march from here ends after one step, in the open
+                }
+                infos[L] = int(found);
             }
-        } else if (!World::laneMayEnter(cx, cy, cz, toSun)) {
-            info = 1;                                   // a march from here ends after one step, in the open
+            info = _mm256_load_si256(reinterpret_cast<const __m256i*>(infos));
         }
-        const bool active = ((info & 4) != 0) == inWater;       // the sample is in this ray's medium
-        const unsigned found = info & 3;
-        const bool march = active && found == 0;
-        needsMarch[i] = march;
-        visible[i] = SEEN[active ? found : 0];
-        marching[i >> 3] += march ? 1 : 0;
-        marchingOutside += (march && !inside) ? 1 : 0;
-        settledRays += (active && !march) ? 1 : 0;
+        const __m256i four = _mm256_set1_epi32(4);
+        const __m256i inMedium = _mm256_and_si256(      // the sample is in this ray's medium
+            real, _mm256_cmpeq_epi32(_mm256_cmpeq_epi32(_mm256_and_si256(info, four), four), mediumIsWater));
+        const __m256i found = _mm256_and_si256(_mm256_and_si256(info, _mm256_set1_epi32(3)), inMedium);
+        const __m256i march = _mm256_and_si256(inMedium, _mm256_cmpeq_epi32(found, _mm256_setzero_si256()));
+        _mm256_store_ps(visible + base, _mm256_permutevar8x32_ps(seen, found));
+        const int marchBits = _mm256_movemask_ps(_mm256_castsi256_ps(march));
+        const int insideBits = _mm256_movemask_ps(_mm256_castsi256_ps(inside));
+        const int mediumBits = _mm256_movemask_ps(_mm256_castsi256_ps(inMedium));
+        for (int L = 0; L < 8; L++) needsMarch[base + L] = (marchBits >> L) & 1;
+        marching[group] = _mm_popcnt_u32(marchBits);
+        marchingOutside += _mm_popcnt_u32(marchBits & ~insideBits);
+        settledRays += _mm_popcnt_u32(mediumBits & ~marchBits);
     }
     t_rayCount += settledRays;
 
@@ -2740,19 +2867,19 @@ Vec3 calculateVolumetrics(const Ray& ray, float maxDist, const World& world, con
         Vec3 sum(0, 0, 0);
         // All samples go through exp8 together, one color at a time
         alignas(32) float tr[3][16];
-        float depths[16];
-        for (int i = 0; i < groups * 8; i++) {
-            depths[i] = std::max(0.0f, float(WATER_LEVEL) - sy[i]);
-            float path = visible[i] > 0.0f ? depths[i] * invDown + ts[i] : 0.0f;
-            for (int c = 0; c < 3; c++) tr[c][i] = -WATER_EXTINCTION[c] * path;
-        }
-        for (int c = 0; c < 3; c++) {
-            for (int group = 0; group < groups; group++) exp8(F8::load(tr[c] + group * 8)).store(tr[c] + group * 8);
+        alignas(32) float light[16];
+        for (int group = 0; group < groups; group++) {
+            int base = group * 8;
+            F8 seen = F8::load(visible + base);
+            F8 lit = cmplt8(F8(0.0f), seen);
+            F8 depth(_mm256_max_ps((F8(float(WATER_LEVEL)) - F8::load(sy + base)).v, _mm256_setzero_ps()));
+            F8 path = and8(depth * F8(invDown) + F8::load(ts + base), lit);
+            for (int c = 0; c < 3; c++) exp8(F8(-WATER_EXTINCTION[c]) * path).store(tr[c] + base);
+            (seen * causticAt8(F8::load(sx + base), F8::load(sz + base), depth, lit)).store(light + base);
         }
         for (int i = 0; i < numSamples; i++) {
             if (visible[i] <= 0.0f) continue;
-            float light = visible[i] * causticAt(sx[i], sz[i], depths[i]);
-            sum += Vec3(tr[0][i], tr[1][i], tr[2][i]) * light;
+            sum += Vec3(tr[0][i], tr[1][i], tr[2][i]) * light[i];
         }
         return sun.getLightContribution() * sum *
                (sun.beamGain * UNDERWATER_SUN_GAIN * WATER_SCATTER * phase * stepSize * g_settings.shaftStrength);
