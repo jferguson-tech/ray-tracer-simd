@@ -470,7 +470,11 @@ struct Settings {
     std::string outputDir = "output";
     int threads = 0;                  // 0 = one per hardware thread
     
+    int renderPreset = 3;             // the render size as a number, 1 to 6
+    float targetFps = 0.0f;           // window: lower the render size while the view moves to hold this (0: off)
+
     void adjustRenderResolution(int preset) {
+        if (preset >= 1 && preset <= 6) renderPreset = preset;
         switch(preset) {
             case 1: renderWidth = 256; renderHeight = 144; break;   // 16:9 (144p)
             case 2: renderWidth = 426; renderHeight = 240; break;   // 16:9 (240p)
@@ -3971,6 +3975,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--resolution" && i + 1 < argc) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
+        } else if (arg == "--fps" && i + 1 < argc) {
+            g_settings.targetFps = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--caustic-quality" && i + 1 < argc) {
             g_settings.causticQuality = std::max(1, std::min(3, std::stoi(argv[++i])));
         } else if (arg == "--play") {
@@ -3986,6 +3992,8 @@ int main(int argc, char* argv[]) {
                          "  --start-frame <n>    with --offline: begin at frame n, to continue a render that was stopped\n"
                          "  --samples <n>        samples per pixel: offline frames (default 1000), --bench (default 32)\n"
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
+                         "  --fps <n>            window: while the view moves, lower the render size as far as needed to\n"
+                         "                       hold n frames per second; the chosen size returns when it stops\n"
                          "  --threads <n>        render threads (default: all)\n"
                          "  --seed <n>           world seed (default 42)\n"
                          "  --caustic-quality <1-3>  caustic map detail: 2, 4 or 8 texels per block (default 2; offline uses 3)\n"
@@ -4142,6 +4150,21 @@ int main(int argc, char* argv[]) {
     int offlineFrameCount = startFrame;
     uint64_t renderedFrames = 0;
     
+    // --fps: the render size the user chose, and how the last frames compared
+    // with the time a frame may take
+    int chosenPreset = g_settings.renderPreset;
+    float workTime = 0.0f;              // the last frame, without the wait for the display
+    int framesOver = 0, framesUnder = 0;
+    float stillTime = 0.0f;
+    auto setRenderPreset = [&](int preset) {
+        g_settings.adjustRenderResolution(preset);
+        renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
+            SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
+        SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+    };
+
     while (running) {
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
@@ -4206,12 +4229,8 @@ int main(int argc, char* argv[]) {
                         // Other controls same as original
                         case SDLK_1: case SDLK_2: case SDLK_3:
                         case SDLK_4: case SDLK_5: case SDLK_6:
-                            g_settings.adjustRenderResolution(event.key.keysym.sym - SDLK_0);
-                            renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
-                            if (texture) SDL_DestroyTexture(texture);
-                            texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
-                                SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
-                            SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+                            chosenPreset = event.key.keysym.sym - SDLK_0;
+                            setRenderPreset(chosenPreset);
                             std::cout << "Render: " << g_settings.renderWidth << "x" << g_settings.renderHeight << "\n";
                             needsReset = true;
                             break;
@@ -4375,6 +4394,36 @@ int main(int argc, char* argv[]) {
             }
         }
         
+        // --fps: while the view moves, lower the render size when frames take
+        // too long and step it back up, as far as the chosen size, when there is
+        // room for the next size (about twice the pixels). A still view goes
+        // back to the chosen size and refines there.
+        if (g_settings.targetFps > 0.0f && !offlineMode && g_settings.mode != Settings::MODE_BENCHMARK) {
+            const float allowed = 1.0f / g_settings.targetFps;
+            int preset = g_settings.renderPreset;
+            if (cameraMoving) {
+                stillTime = 0.0f;
+                framesOver = workTime > allowed * 1.1f ? framesOver + 1 : 0;
+                framesUnder = workTime < allowed * 0.4f ? framesUnder + 1 : 0;
+                if (framesOver >= 2 && preset > 1) {
+                    // Far over: straight to the size whose pixel count should fit
+                    static const float pixels[7] = {0, 256 * 144, 426 * 240, 640 * 360, 854 * 480, 1280 * 720, 1920 * 1080};
+                    const float perPixel = workTime / pixels[preset];
+                    preset--;
+                    while (preset > 1 && perPixel * pixels[preset] > allowed) preset--;
+                }
+                else if (framesUnder >= 12 && preset < chosenPreset) preset++;
+            } else {
+                stillTime += deltaTime;
+                if (stillTime >= 0.3f) preset = chosenPreset;
+            }
+            if (preset != g_settings.renderPreset) {
+                setRenderPreset(preset);
+                framesOver = framesUnder = 0;
+                needsReset = true;
+            }
+        }
+
         if (needsReset) {
             renderer.reset();
         }
@@ -4420,6 +4469,7 @@ int main(int argc, char* argv[]) {
                             g_settings.renderWidth * sizeof(uint32_t));
             SDL_RenderClear(sdlRenderer);
             SDL_RenderCopy(sdlRenderer, texture, nullptr, nullptr);
+            workTime = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - currentTime).count();
             SDL_RenderPresent(sdlRenderer);
         }
         
@@ -4437,6 +4487,9 @@ int main(int argc, char* argv[]) {
             if (!offlineMode) {
                 std::cout << "FPS: " << frameCount << " (Samples: " 
                          << renderer.getSampleCount() << ")";
+                if (g_settings.targetFps > 0.0f) {
+                    std::cout << " [" << g_settings.renderWidth << "x" << g_settings.renderHeight << "]";
+                }
                 
                 switch (g_settings.mode) {
                     case Settings::MODE_RECORDING:
