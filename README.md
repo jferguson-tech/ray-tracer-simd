@@ -176,6 +176,7 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 | `F1` | Start or stop recording a camera path |
 | `F2` / `F3` | Play the path / benchmark it |
 | `F5` / `F6` | Save / load the path |
+| `P` | Save the image as shown to `output/screenshot_NNNN.png` |
 | Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic map detail |
 | `N` | Toggle the denoiser |
 | `H` | Toggle the denoiser's reuse of the previous view |
