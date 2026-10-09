@@ -206,9 +206,10 @@ struct CameraKeyframe {
     float time;
     float x, y, z;
     float yaw, pitch;
+    float timeOfDay;        // 0 to 1, or negative: this keyframe does not set it
     
-    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch)
-        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch) {}
+    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f)
+        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch), timeOfDay(timeOfDay) {}
 };
 
 // Demo path recorder/player
@@ -217,9 +218,36 @@ public:
     std::vector<CameraKeyframe> keyframes;
     float totalDuration = 0;
     
-    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch) {
-        keyframes.emplace_back(time, x, y, z, yaw, pitch);
+    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f) {
+        keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
         totalDuration = std::max(totalDuration, time);
+    }
+
+    // The time of day at a moment of the path, if any of its keyframes sets
+    // one: it moves evenly from one keyframe that sets it to the next, and
+    // holds the first value before the first of them and the last value after
+    // the last.
+    bool getTimeOfDay(float time, float& timeOfDay) const {
+        if (totalDuration > 0) {            // the path loops, like the camera
+            time = std::fmod(time, totalDuration);
+            if (time < 0) time += totalDuration;
+        }
+        const CameraKeyframe* before = nullptr;
+        const CameraKeyframe* after = nullptr;
+        for (const auto& kf : keyframes) {
+            if (kf.timeOfDay < 0.0f) continue;
+            if (kf.time > time) { after = &kf; break; }
+            before = &kf;
+        }
+        if (!before && !after) return false;
+        if (!before || !after) {
+            timeOfDay = (before ? before : after)->timeOfDay;
+            return true;
+        }
+        float span = after->time - before->time;
+        float t = span > 1e-6f ? (time - before->time) / span : 0.0f;
+        timeOfDay = before->timeOfDay + (after->timeOfDay - before->timeOfDay) * t;
+        return true;
     }
     
     void clear() {
@@ -288,6 +316,7 @@ public:
             json.addNumber("z", kf.z);
             json.addNumber("yaw", kf.yaw);
             json.addNumber("pitch", kf.pitch);
+            if (kf.timeOfDay >= 0.0f) json.addNumber("time_of_day", kf.timeOfDay);
             json.endObject();
         }
         
@@ -349,9 +378,17 @@ public:
                 size_t pitchPos = content.find("\"pitch\":", kfPos);
                 pitch = std::stof(content.substr(pitchPos + 8));
                 
-                keyframes.emplace_back(time, x, y, z, yaw, pitch);
+                // Optional: the time of day from this keyframe on (see getTimeOfDay)
+                float timeOfDay = -1.0f;
+                size_t closePos = content.find("}", kfPos);
+                size_t dayPos = content.find("\"time_of_day\":", kfPos);
+                if (dayPos != std::string::npos && dayPos < closePos) {
+                    timeOfDay = std::max(0.0f, std::min(1.0f, std::stof(content.substr(dayPos + 14))));
+                }
                 
-                kfPos = content.find("}", kfPos);
+                keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
+                
+                kfPos = closePos;
             }
         }
         
@@ -450,6 +487,7 @@ struct Settings {
     bool enableCaustics = true;
     bool enableVolumetrics = true;
     bool sampleLamps = true;          // sample light blocks directly (off: found by bounces only)
+    bool resampleLamps = false;       // ... weighing every nearby one first (off: one picked at random)
     bool enableParticles = true;      // drifting specks in the water
     bool denoise = false;             // filter the image along surfaces before it is shown or saved
     bool temporal = false;            // the denoiser also reuses the previous view's samples
@@ -471,7 +509,11 @@ struct Settings {
     int threads = 0;                  // 0 = one per hardware thread
     float adaptiveTolerance = 0.0f;   // --adaptive: stop sampling where the image is this steady (0: off)
     
+    int renderPreset = 3;             // the render size as a number, 1 to 6
+    float targetFps = 0.0f;           // window: lower the render size while the view moves to hold this (0: off)
+
     void adjustRenderResolution(int preset) {
+        if (preset >= 1 && preset <= 6) renderPreset = preset;
         switch(preset) {
             case 1: renderWidth = 256; renderHeight = 144; break;   // 16:9 (144p)
             case 2: renderWidth = 426; renderHeight = 240; break;   // 16:9 (240p)
@@ -1676,6 +1718,10 @@ public:
     struct LightCell {
         int count = 0;
         int index[MAX_CELL_LIGHTS];
+        // The same blocks side by side for the 8-wide lamp sampling: their low
+        // corners and block types (unused places are zero)
+        float x[MAX_CELL_LIGHTS] = {}, y[MAX_CELL_LIGHTS] = {}, z[MAX_CELL_LIGHTS] = {};
+        uint8_t type[MAX_CELL_LIGHTS] = {};
     };
 
     const LightCell& lightsNear(const Vec3& p) const {
@@ -1771,7 +1817,14 @@ public:
                     std::sort(closest.begin(), closest.end());
                     LightCell& cell = lightCells[cx + cy * CELLS_X + cz * CELLS_X * CELLS_Y];
                     cell.count = std::min(MAX_CELL_LIGHTS, static_cast<int>(closest.size()));
-                    for (int k = 0; k < cell.count; k++) cell.index[k] = closest[k].second;
+                    for (int k = 0; k < cell.count; k++) {
+                        const Vec3i& L = lights[closest[k].second];
+                        cell.index[k] = closest[k].second;
+                        cell.x[k] = float(L.x);
+                        cell.y[k] = float(L.y);
+                        cell.z[k] = float(L.z);
+                        cell.type[k] = static_cast<uint8_t>(getBlock(L.x, L.y, L.z));
+                    }
                 }
             }
         }
@@ -3018,6 +3071,23 @@ inline Vec3 lampEmission(BlockType block) {
     return g_materials[block].emission;
 }
 
+// The faces of a light block that look toward a point: at most three
+struct LampFaces {
+    int count = 0;
+    int axis[3];
+    float side[3];      // 0: the face at the block's low end of that axis, 1: at its high end
+};
+inline LampFaces lampFacesToward(const Vec3i& lamp, const Vec3& p) {
+    const float point[3] = {p.x, p.y, p.z};
+    const int corner[3] = {lamp.x, lamp.y, lamp.z};
+    LampFaces faces;
+    for (int a = 0; a < 3; a++) {
+        if (point[a] < float(corner[a])) { faces.axis[faces.count] = a; faces.side[faces.count++] = 0.0f; }
+        else if (point[a] > float(corner[a] + 1)) { faces.axis[faces.count] = a; faces.side[faces.count++] = 1.0f; }
+    }
+    return faces;
+}
+
 // Surface color of a block at a point: its procedural texture, or the plain
 // material color for blocks without one
 inline Vec3 surfaceAlbedo(BlockType block, const Vec3& pos, const Vec3& normal) {
@@ -3709,6 +3779,96 @@ public:
     }
 };
 
+// Direct light from nearby light blocks, through one shadow ray. A random
+// point is taken on each of them (on a face that looks this way) and what it
+// would add here is worked out without the shadow test, for all eight
+// blocks of the cell at once. One of the points is then picked with a
+// chance in proportion to that, and only it is traced; dividing by the
+// chance keeps the average right. Near or bright blocks get the ray far
+// more often than dim, distant or turned-away ones. The blocks share the
+// random numbers for the point: each one's point is still evenly spread
+// over its faces, which is all the average needs.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+Vec3 resampledLampLight(const World& world, const World::LightCell& cell, const Vec3& shadeOrigin,
+                        const Vec3& hitNormal, bool wet, bool lastSurface) {
+    Vec3 lampLight(0, 0, 0);
+    const float pickFace = random01(), u = random01(), v = random01(), pickLamp = random01();
+    const F8 one(1.0f), zero;
+    auto choose = [](F8 mask, F8 a, F8 b) { return F8(_mm256_blendv_ps(b.v, a.v, mask.v)); };
+    auto equal = [](F8 a, F8 b) { return F8(_mm256_cmp_ps(a.v, b.v, _CMP_EQ_OQ)); };
+    const F8 cornerX = F8::load(cell.x), cornerY = F8::load(cell.y), cornerZ = F8::load(cell.z);
+    const F8 px(shadeOrigin.x), py(shadeOrigin.y), pz(shadeOrigin.z);
+
+    // The faces that look toward this point: per axis the low one, the high one or neither
+    const F8 highX = cmplt8(cornerX + one, px), highY = cmplt8(cornerY + one, py), highZ = cmplt8(cornerZ + one, pz);
+    const F8 frontX = F8(_mm256_or_ps(cmplt8(px, cornerX).v, highX.v));
+    const F8 frontY = F8(_mm256_or_ps(cmplt8(py, cornerY).v, highY.v));
+    const F8 frontZ = F8(_mm256_or_ps(cmplt8(pz, cornerZ).v, highZ.v));
+    const F8 countX = and8(frontX, one), countY = and8(frontY, one), countZ = and8(frontZ, one);
+    const F8 faces = countX + countY + countZ;
+    // One of them at random; the point on it
+    const F8 which = min8(faces - one, floor8(F8(pickFace) * faces));
+    const F8 isX = and8(frontX, equal(which, zero)), isY = and8(frontY, equal(which, countX));
+    const F8 U(u), V(v);
+    const F8 pointX = choose(isX, and8(highX, one), choose(isY, V, U));
+    const F8 pointY = choose(isX, U, choose(isY, and8(highY, one), V));
+    const F8 pointZ = choose(isX, V, choose(isY, U, and8(highZ, one)));
+    const F8 toX = cornerX + pointX - px, toY = cornerY + pointY - py, toZ = cornerZ + pointZ - pz;
+    const F8 dist2 = toX * toX + toY * toY + toZ * toZ;
+    // What the point adds, per unit of the block's light: the density of
+    // the diffuse bounce in this direction over the density of the point
+    // (both per solid angle), times the point's share of the two (power
+    // heuristic). At a path's last surface the bounce is not followed, so
+    // the point counts in full. With
+    //   onSurface = normal . toLamp,  onLamp = |toLamp along the face's axis| * faces
+    // the densities are onSurface / (pi dist) and dist^3 / onLamp, and the
+    // whole thing needs neither the distance itself nor a square root.
+    const F8 onSurface = F8(hitNormal.x) * toX + F8(hitNormal.y) * toY + F8(hitNormal.z) * toZ;
+    const F8 onLamp = abs8(choose(isX, toX, choose(isY, toY, toZ))) * faces;
+    const F8 both = onSurface * onLamp * F8(1.0f / float(M_PI));
+    const F8 dist4 = dist2 * dist2;
+    const F8 gain = lastSurface ? both / dist4 : both * dist4 / (dist4 * dist4 + both * both);
+    F8 usable = and8(cmplt8(zero, onLamp), cmplt8(F8(1e-6f), dist2));
+    usable = and8(usable, cmplt8(zero, onSurface));
+
+    // Weight by brightness; blocks beyond cell.count have none
+    alignas(32) float brightness[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    Vec3 emission[World::MAX_CELL_LIGHTS];
+    for (int i = 0; i < cell.count; i++) {
+        emission[i] = lampEmission(static_cast<BlockType>(cell.type[i]));
+        brightness[i] = emission[i].x * 0.2126f + emission[i].y * 0.7152f + emission[i].z * 0.0722f;
+    }
+    alignas(32) float weight[8], towardX[8], towardY[8], towardZ[8];
+    and8(usable, gain * F8::load(brightness)).store(weight);
+    toX.store(towardX); toY.store(towardY); toZ.store(towardZ);
+
+    float weightSum = 0.0f;
+    for (int i = 0; i < cell.count; i++) weightSum += weight[i];
+    if (weightSum > 0.0f) {
+        const float pick = pickLamp * weightSum;
+        int chosen = -1;
+        float running = 0.0f;
+        for (int i = 0; i < cell.count; i++) {
+            if (weight[i] <= 0.0f) continue;
+            chosen = i;
+            running += weight[i];
+            if (pick < running) break;
+        }
+        Vec3 toLamp(towardX[chosen], towardY[chosen], towardZ[chosen]);
+        float dist = toLamp.length();
+        if (world.firstSolid(shadeOrigin, toLamp / dist, dist - 2e-3f) == AIR) {
+            // What the point adds, divided by its chance of being picked
+            lampLight = emission[chosen] * (weightSum / brightness[chosen]);
+            if (wet) lampLight = lampLight * waterTransmittance(dist);
+        }
+    }
+    return lampLight;
+}
+
 // Complete trace function implementation
 Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool cameraPath,
            const Vec3* lampFrom, float bouncePdf) {
@@ -3824,7 +3984,10 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
                 const Vec3i& L = world.light(cell.index[i]);
                 if (L.x == lx && L.y == ly && L.z == lz) {
                     float cosLight = std::max(1e-4f, -hitNormal.dot(ray.direction));
-                    float lampPdf = hitDistance * hitDistance / (cosLight * cell.count * 6.0f);
+                    // The same density the surface used for this block (see below)
+                    float choices = g_settings.resampleLamps ? float(std::max(1, lampFacesToward(L, *lampFrom).count))
+                                                             : cell.count * 6.0f;
+                    float lampPdf = hitDistance * hitDistance / (cosLight * choices);
                     emission = emission * (bouncePdf * bouncePdf / (bouncePdf * bouncePdf + lampPdf * lampPdf));
                     break;
                 }
@@ -3874,10 +4037,13 @@ Vec3 trace(const Ray& ray, const World& world, int depth, bool insideWater, bool
         }
     }
 
-    // Direct light from nearby light blocks: one random point on one of them
+    // Direct light from nearby light blocks
     Vec3 lampLight(0, 0, 0);
     const World::LightCell& cell = world.lightsNear(shadeOrigin);
-    if (g_settings.sampleLamps && cell.count > 0) {
+    if (g_settings.sampleLamps && g_settings.resampleLamps && cell.count > 0) {
+        lampLight = resampledLampLight(world, cell, shadeOrigin, hitNormal, wet, depth == 1);
+    } else if (g_settings.sampleLamps && cell.count > 0) {
+        // One random point on one of the blocks
         const Vec3i& L = world.light(cell.index[std::min(cell.count - 1, int(random01() * cell.count))]);
         int face = std::min(5, int(random01() * 6.0f));
         int axis = face / 2;
@@ -4050,6 +4216,8 @@ int main(int argc, char* argv[]) {
             g_settings.enableCaustics = false;
         } else if (arg == "--no-volumetrics") {
             g_settings.enableVolumetrics = false;
+        } else if (arg == "--lamp-resampling") {
+            g_settings.resampleLamps = true;
         } else if (arg == "--no-lamp-sampling") {
             g_settings.sampleLamps = false;
         } else if (arg == "--dump-caustics") {
@@ -4083,6 +4251,8 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc && (std::isdigit(static_cast<unsigned char>(argv[i + 1][0])) || argv[i + 1][0] == '.')) {
                 g_settings.adaptiveTolerance = std::max(0.0f, std::stof(argv[++i]));
             }
+        } else if (arg == "--fps" && i + 1 < argc) {
+            g_settings.targetFps = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--caustic-quality" && i + 1 < argc) {
             g_settings.causticQuality = std::max(1, std::min(3, std::stoi(argv[++i])));
         } else if (arg == "--play") {
@@ -4102,6 +4272,8 @@ int main(int argc, char* argv[]) {
                          "                       settled; --samples is then the most a pixel gets. t is how far the\n"
                          "                       picture may still be from settled, in steps of its 8-bit values\n"
                          "                       (default 1; smaller is stricter). Not used with --denoise\n"
+                         "  --fps <n>            window: while the view moves, lower the render size as far as needed to\n"
+                         "                       hold n frames per second; the chosen size returns when it stops\n"
                          "  --threads <n>        render threads (default: all)\n"
                          "  --seed <n>           world seed (default 42)\n"
                          "  --caustic-quality <1-3>  caustic map detail: 2, 4 or 8 texels per block (default 2; offline uses 3)\n"
@@ -4116,6 +4288,8 @@ int main(int argc, char* argv[]) {
                          "  --dump-caustics          write the caustic map's layers to output/ as images and exit\n"
                          "  --time <0-1>         time of day (default 0.85; 0.5 is midday)\n"
                          "  --no-caustics, --no-volumetrics   turn an effect off\n"
+                         "  --lamp-resampling    weigh every nearby light block before the shadow ray instead of picking\n"
+                         "                       one at random: less noise around lamps, about 7% slower per sample\n"
                          "  --no-lamp-sampling   find light blocks by bounces only (slower to converge; for comparison)\n";
             return 0;
         } else if (!arg.empty() && arg[0] != '-') {
@@ -4210,6 +4384,7 @@ int main(int argc, char* argv[]) {
     int frameCount = 0;
     int currentFPS = 0;
     float demoTime = 0;
+    float recordedTimeOfDay = g_settings.timeOfDay;     // as of the last recorded keyframe
     
     // Load demo if in playback/benchmark/offline mode
     if (g_settings.mode == Settings::MODE_PLAYBACK || 
@@ -4241,6 +4416,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\nControls:\n";
     std::cout << "F1: Start/Stop Recording | F2: Play Demo | F3: Benchmark\n";
     std::cout << "F5: Save Demo | F6: Load Demo\n";
+    std::cout << "P: Save the image to output/screenshot_NNNN.png\n";
     std::cout << "Movement: WASD + Space/Shift | Look: Mouse\n";
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
@@ -4258,6 +4434,21 @@ int main(int argc, char* argv[]) {
     int offlineFrameCount = startFrame;
     uint64_t renderedFrames = 0;
     
+    // --fps: the render size the user chose, and how the last frames compared
+    // with the time a frame may take
+    int chosenPreset = g_settings.renderPreset;
+    float workTime = 0.0f;              // the last frame, without the wait for the display
+    int framesOver = 0, framesUnder = 0;
+    float stillTime = 0.0f;
+    auto setRenderPreset = [&](int preset) {
+        g_settings.adjustRenderResolution(preset);
+        renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
+            SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
+        SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+    };
+
     while (running) {
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
@@ -4287,6 +4478,7 @@ int main(int argc, char* argv[]) {
                                 g_settings.mode = Settings::MODE_RECORDING;
                                 demoPath.clear();
                                 startTime = currentTime;
+                                recordedTimeOfDay = g_settings.timeOfDay;
                                 std::cout << "Recording started...\n";
                             }
                             break;
@@ -4318,16 +4510,30 @@ int main(int argc, char* argv[]) {
                         case SDLK_F6:
                             demoPath.loadFromFile(demoFile);
                             break;
+
+                        case SDLK_p: {
+                            // The image as it is shown, under the first number not yet used
+                            std::filesystem::create_directories(g_settings.outputDir);
+                            std::string name;
+                            for (int n = 1; n < 100000; n++) {
+                                std::stringstream ss;
+                                ss << g_settings.outputDir << "/screenshot_" << std::setfill('0') << std::setw(4) << n << ".png";
+                                name = ss.str();
+                                if (!std::filesystem::exists(name)) break;
+                            }
+                            if (renderer.saveFrame(name)) {
+                                std::cout << "Saved " << name << " (samples: " << renderer.getSampleCount() << ")\n";
+                            } else {
+                                std::cerr << "Could not write " << name << "\n";
+                            }
+                            break;
+                        }
                         
                         // Other controls same as original
                         case SDLK_1: case SDLK_2: case SDLK_3:
                         case SDLK_4: case SDLK_5: case SDLK_6:
-                            g_settings.adjustRenderResolution(event.key.keysym.sym - SDLK_0);
-                            renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
-                            if (texture) SDL_DestroyTexture(texture);
-                            texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
-                                SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
-                            SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+                            chosenPreset = event.key.keysym.sym - SDLK_0;
+                            setRenderPreset(chosenPreset);
                             std::cout << "Render: " << g_settings.renderWidth << "x" << g_settings.renderHeight << "\n";
                             needsReset = true;
                             break;
@@ -4444,8 +4650,16 @@ int main(int argc, char* argv[]) {
         if (g_settings.mode == Settings::MODE_RECORDING) {
             float recordInterval = 0.033f; // 30 Hz recording rate
             if (std::chrono::duration<float>(currentTime - lastRecordTime).count() >= recordInterval) {
+                // T or G was pressed since the last keyframe: that one keeps
+                // the time of day from before, this one gets the new one
+                if (recordedTimeOfDay != g_settings.timeOfDay && !demoPath.keyframes.empty() &&
+                    demoPath.keyframes.back().timeOfDay < 0.0f) {
+                    demoPath.keyframes.back().timeOfDay = recordedTimeOfDay;
+                }
                 demoPath.addKeyframe(totalElapsed, camera.position.x, camera.position.y, 
-                                    camera.position.z, camera.yaw, camera.pitch);
+                                    camera.position.z, camera.yaw, camera.pitch,
+                                    recordedTimeOfDay != g_settings.timeOfDay ? g_settings.timeOfDay : -1.0f);
+                recordedTimeOfDay = g_settings.timeOfDay;
                 lastRecordTime = currentTime;
             }
         }
@@ -4468,6 +4682,8 @@ int main(int argc, char* argv[]) {
             float x, y, z, yaw, pitch;
             if (demoPath.getInterpolatedCamera(demoTime, x, y, z, yaw, pitch)) {
                 camera.setFromKeyframe(x, y, z, yaw, pitch);
+                // A path that sets the time of day moves the sun with it
+                demoPath.getTimeOfDay(demoTime, g_settings.timeOfDay);
                 
                 // Only mark camera as moving for non-offline modes
                 if (g_settings.mode != Settings::MODE_OFFLINE_RENDER) {
@@ -4491,6 +4707,36 @@ int main(int argc, char* argv[]) {
             }
         }
         
+        // --fps: while the view moves, lower the render size when frames take
+        // too long and step it back up, as far as the chosen size, when there is
+        // room for the next size (about twice the pixels). A still view goes
+        // back to the chosen size and refines there.
+        if (g_settings.targetFps > 0.0f && !offlineMode && g_settings.mode != Settings::MODE_BENCHMARK) {
+            const float allowed = 1.0f / g_settings.targetFps;
+            int preset = g_settings.renderPreset;
+            if (cameraMoving) {
+                stillTime = 0.0f;
+                framesOver = workTime > allowed * 1.1f ? framesOver + 1 : 0;
+                framesUnder = workTime < allowed * 0.4f ? framesUnder + 1 : 0;
+                if (framesOver >= 2 && preset > 1) {
+                    // Far over: straight to the size whose pixel count should fit
+                    static const float pixels[7] = {0, 256 * 144, 426 * 240, 640 * 360, 854 * 480, 1280 * 720, 1920 * 1080};
+                    const float perPixel = workTime / pixels[preset];
+                    preset--;
+                    while (preset > 1 && perPixel * pixels[preset] > allowed) preset--;
+                }
+                else if (framesUnder >= 12 && preset < chosenPreset) preset++;
+            } else {
+                stillTime += deltaTime;
+                if (stillTime >= 0.3f) preset = chosenPreset;
+            }
+            if (preset != g_settings.renderPreset) {
+                setRenderPreset(preset);
+                framesOver = framesUnder = 0;
+                needsReset = true;
+            }
+        }
+
         if (needsReset) {
             renderer.reset();
         }
@@ -4542,6 +4788,7 @@ int main(int argc, char* argv[]) {
                             g_settings.renderWidth * sizeof(uint32_t));
             SDL_RenderClear(sdlRenderer);
             SDL_RenderCopy(sdlRenderer, texture, nullptr, nullptr);
+            workTime = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - currentTime).count();
             SDL_RenderPresent(sdlRenderer);
         }
         
@@ -4559,6 +4806,9 @@ int main(int argc, char* argv[]) {
             if (!offlineMode) {
                 std::cout << "FPS: " << frameCount << " (Samples: " 
                          << renderer.getSampleCount() << ")";
+                if (g_settings.targetFps > 0.0f) {
+                    std::cout << " [" << g_settings.renderWidth << "x" << g_settings.renderHeight << "]";
+                }
                 
                 switch (g_settings.mode) {
                     case Settings::MODE_RECORDING:

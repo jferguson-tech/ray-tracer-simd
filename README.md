@@ -80,6 +80,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--samples <n>` | Samples per pixel: offline frames (default 1000), `--bench` (default 32) |
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
 | `--adaptive [t]` | `--offline` and `--bench`: stop sampling the parts of the image that have settled; `--samples` is then the most a pixel gets. `t` is how far the picture may still be from settled, in steps of its 8-bit values (default 1; smaller is stricter). Not used with `--denoise` (default: off) |
+| `--fps <n>` | Window: while the view moves, lower the render size as far as needed to hold `n` frames per second; the chosen size returns when the view stops (default: off) |
 | `--threads <n>` | Render threads (default: all) |
 | `--seed <n>` | World seed (default 42) |
 | `--time <0-1>` | Time of day (default 0.85; 0.5 is midday) |
@@ -91,6 +92,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--temporal`, `--no-temporal` | The denoiser also reuses the previous view's samples (default: on in the window). With `--offline --denoise`, a frame then depends on the frames rendered before it |
 | `--dump-caustics` | Write the caustic map's layers to `output/` as images and exit |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
+| `--lamp-resampling` | Weigh every nearby light block before the shadow ray instead of picking one at random: less noise around lamps, about 7% more time per sample (default: off) |
 | `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
 
 ### Fixed benchmark
@@ -177,6 +179,7 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 | `F1` | Start or stop recording a camera path |
 | `F2` / `F3` | Play the path / benchmark it |
 | `F5` / `F6` | Save / load the path |
+| `P` | Save the image as shown to `output/screenshot_NNNN.png` |
 | Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic map detail |
 | `N` | Toggle the denoiser |
 | `H` | Toggle the denoiser's reuse of the previous view |
@@ -185,6 +188,16 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 The water animates while the view is changing and holds still while a still
 view accumulates samples, so the image converges. In offline renders the water
 follows each frame's time, so its speed does not depend on `--samples`.
+
+A camera path can move the sun. A keyframe may carry `"time_of_day"` (0 to 1,
+as `--time`); the time of day moves evenly from one keyframe that sets it to the
+next, and holds the first value before and the last value after. Such a path
+overrides `--time`; a path without it renders as before. While recording, `T`
+and `G` are stored in the path.
+
+```json
+{ "time": 0.0, "x": 56.0, "y": 15.8, "z": 66.0, "yaw": 2.45, "pitch": -0.35, "time_of_day": 0.5 }
+```
 
 ### Video Creation
 ```bash
@@ -230,6 +243,10 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   specks drifting in the water are worked out once per block and thread instead of per ray
 - The twelve light-shaft samples of a camera ray are set up eight at a time: positions,
   the sun band lookup and, under water, the absorption and the caustic map
+- With `--lamp-resampling`, a surface takes a random point on each of the up to eight light
+  blocks near it, works out in one 8-wide pass (one division, no square root) what each would
+  add without its shadow, picks one with a chance in proportion to that and traces a single
+  shadow ray to it. The average stays the same; the ray goes where the light is
 - Persistent worker threads for render passes, image conversion and the caustic map; the
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
