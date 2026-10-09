@@ -177,6 +177,7 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 | `F1` | Start or stop recording a camera path |
 | `F2` / `F3` | Play the path / benchmark it |
 | `F5` / `F6` | Save / load the path |
+| `P` | Save the image as shown to `output/screenshot_NNNN.png` |
 | Keypad `1` `2` `3` | Toggle caustics, toggle volumetrics, caustic map detail |
 | `N` | Toggle the denoiser |
 | `H` | Toggle the denoiser's reuse of the previous view |
@@ -185,6 +186,16 @@ The filter takes about 17 ms at 640x360 and 60 ms at 1280x720 on an AMD Ryzen 9
 The water animates while the view is changing and holds still while a still
 view accumulates samples, so the image converges. In offline renders the water
 follows each frame's time, so its speed does not depend on `--samples`.
+
+A camera path can move the sun. A keyframe may carry `"time_of_day"` (0 to 1,
+as `--time`); the time of day moves evenly from one keyframe that sets it to the
+next, and holds the first value before and the last value after. Such a path
+overrides `--time`; a path without it renders as before. While recording, `T`
+and `G` are stored in the path.
+
+```json
+{ "time": 0.0, "x": 56.0, "y": 15.8, "z": 66.0, "yaw": 2.45, "pitch": -0.35, "time_of_day": 0.5 }
+```
 
 ### Video Creation
 ```bash

@@ -206,9 +206,10 @@ struct CameraKeyframe {
     float time;
     float x, y, z;
     float yaw, pitch;
+    float timeOfDay;        // 0 to 1, or negative: this keyframe does not set it
     
-    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch)
-        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch) {}
+    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f)
+        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch), timeOfDay(timeOfDay) {}
 };
 
 // Demo path recorder/player
@@ -217,9 +218,36 @@ public:
     std::vector<CameraKeyframe> keyframes;
     float totalDuration = 0;
     
-    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch) {
-        keyframes.emplace_back(time, x, y, z, yaw, pitch);
+    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f) {
+        keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
         totalDuration = std::max(totalDuration, time);
+    }
+
+    // The time of day at a moment of the path, if any of its keyframes sets
+    // one: it moves evenly from one keyframe that sets it to the next, and
+    // holds the first value before the first of them and the last value after
+    // the last.
+    bool getTimeOfDay(float time, float& timeOfDay) const {
+        if (totalDuration > 0) {            // the path loops, like the camera
+            time = std::fmod(time, totalDuration);
+            if (time < 0) time += totalDuration;
+        }
+        const CameraKeyframe* before = nullptr;
+        const CameraKeyframe* after = nullptr;
+        for (const auto& kf : keyframes) {
+            if (kf.timeOfDay < 0.0f) continue;
+            if (kf.time > time) { after = &kf; break; }
+            before = &kf;
+        }
+        if (!before && !after) return false;
+        if (!before || !after) {
+            timeOfDay = (before ? before : after)->timeOfDay;
+            return true;
+        }
+        float span = after->time - before->time;
+        float t = span > 1e-6f ? (time - before->time) / span : 0.0f;
+        timeOfDay = before->timeOfDay + (after->timeOfDay - before->timeOfDay) * t;
+        return true;
     }
     
     void clear() {
@@ -288,6 +316,7 @@ public:
             json.addNumber("z", kf.z);
             json.addNumber("yaw", kf.yaw);
             json.addNumber("pitch", kf.pitch);
+            if (kf.timeOfDay >= 0.0f) json.addNumber("time_of_day", kf.timeOfDay);
             json.endObject();
         }
         
@@ -349,9 +378,17 @@ public:
                 size_t pitchPos = content.find("\"pitch\":", kfPos);
                 pitch = std::stof(content.substr(pitchPos + 8));
                 
-                keyframes.emplace_back(time, x, y, z, yaw, pitch);
+                // Optional: the time of day from this keyframe on (see getTimeOfDay)
+                float timeOfDay = -1.0f;
+                size_t closePos = content.find("}", kfPos);
+                size_t dayPos = content.find("\"time_of_day\":", kfPos);
+                if (dayPos != std::string::npos && dayPos < closePos) {
+                    timeOfDay = std::max(0.0f, std::min(1.0f, std::stof(content.substr(dayPos + 14))));
+                }
                 
-                kfPos = content.find("}", kfPos);
+                keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
+                
+                kfPos = closePos;
             }
         }
         
@@ -4102,6 +4139,7 @@ int main(int argc, char* argv[]) {
     int frameCount = 0;
     int currentFPS = 0;
     float demoTime = 0;
+    float recordedTimeOfDay = g_settings.timeOfDay;     // as of the last recorded keyframe
     
     // Load demo if in playback/benchmark/offline mode
     if (g_settings.mode == Settings::MODE_PLAYBACK || 
@@ -4133,6 +4171,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\nControls:\n";
     std::cout << "F1: Start/Stop Recording | F2: Play Demo | F3: Benchmark\n";
     std::cout << "F5: Save Demo | F6: Load Demo\n";
+    std::cout << "P: Save the image to output/screenshot_NNNN.png\n";
     std::cout << "Movement: WASD + Space/Shift | Look: Mouse\n";
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
@@ -4194,6 +4233,7 @@ int main(int argc, char* argv[]) {
                                 g_settings.mode = Settings::MODE_RECORDING;
                                 demoPath.clear();
                                 startTime = currentTime;
+                                recordedTimeOfDay = g_settings.timeOfDay;
                                 std::cout << "Recording started...\n";
                             }
                             break;
@@ -4225,6 +4265,24 @@ int main(int argc, char* argv[]) {
                         case SDLK_F6:
                             demoPath.loadFromFile(demoFile);
                             break;
+
+                        case SDLK_p: {
+                            // The image as it is shown, under the first number not yet used
+                            std::filesystem::create_directories(g_settings.outputDir);
+                            std::string name;
+                            for (int n = 1; n < 100000; n++) {
+                                std::stringstream ss;
+                                ss << g_settings.outputDir << "/screenshot_" << std::setfill('0') << std::setw(4) << n << ".png";
+                                name = ss.str();
+                                if (!std::filesystem::exists(name)) break;
+                            }
+                            if (renderer.saveFrame(name)) {
+                                std::cout << "Saved " << name << " (samples: " << renderer.getSampleCount() << ")\n";
+                            } else {
+                                std::cerr << "Could not write " << name << "\n";
+                            }
+                            break;
+                        }
                         
                         // Other controls same as original
                         case SDLK_1: case SDLK_2: case SDLK_3:
@@ -4347,8 +4405,16 @@ int main(int argc, char* argv[]) {
         if (g_settings.mode == Settings::MODE_RECORDING) {
             float recordInterval = 0.033f; // 30 Hz recording rate
             if (std::chrono::duration<float>(currentTime - lastRecordTime).count() >= recordInterval) {
+                // T or G was pressed since the last keyframe: that one keeps
+                // the time of day from before, this one gets the new one
+                if (recordedTimeOfDay != g_settings.timeOfDay && !demoPath.keyframes.empty() &&
+                    demoPath.keyframes.back().timeOfDay < 0.0f) {
+                    demoPath.keyframes.back().timeOfDay = recordedTimeOfDay;
+                }
                 demoPath.addKeyframe(totalElapsed, camera.position.x, camera.position.y, 
-                                    camera.position.z, camera.yaw, camera.pitch);
+                                    camera.position.z, camera.yaw, camera.pitch,
+                                    recordedTimeOfDay != g_settings.timeOfDay ? g_settings.timeOfDay : -1.0f);
+                recordedTimeOfDay = g_settings.timeOfDay;
                 lastRecordTime = currentTime;
             }
         }
@@ -4371,6 +4437,8 @@ int main(int argc, char* argv[]) {
             float x, y, z, yaw, pitch;
             if (demoPath.getInterpolatedCamera(demoTime, x, y, z, yaw, pitch)) {
                 camera.setFromKeyframe(x, y, z, yaw, pitch);
+                // A path that sets the time of day moves the sun with it
+                demoPath.getTimeOfDay(demoTime, g_settings.timeOfDay);
                 
                 // Only mark camera as moving for non-offline modes
                 if (g_settings.mode != Settings::MODE_OFFLINE_RENDER) {
