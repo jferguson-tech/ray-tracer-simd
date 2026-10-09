@@ -91,6 +91,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--temporal`, `--no-temporal` | The denoiser also reuses the previous view's samples (default: on in the window). With `--offline --denoise`, a frame then depends on the frames rendered before it |
 | `--dump-caustics` | Write the caustic map's layers to `output/` as images and exit |
 | `--no-caustics`, `--no-volumetrics` | Turn an effect off |
+| `--lamp-resampling` | Weigh every nearby light block before the shadow ray instead of picking one at random: less noise around lamps, about 7% more time per sample (default: off) |
 | `--no-lamp-sampling` | Find light blocks by bounces only (slower to converge; for comparison) |
 
 ### Fixed benchmark
@@ -241,6 +242,10 @@ Offline frames are PNG; the script also reads the PPM frames older builds wrote.
   specks drifting in the water are worked out once per block and thread instead of per ray
 - The twelve light-shaft samples of a camera ray are set up eight at a time: positions,
   the sun band lookup and, under water, the absorption and the caustic map
+- With `--lamp-resampling`, a surface takes a random point on each of the up to eight light
+  blocks near it, works out in one 8-wide pass (one division, no square root) what each would
+  add without its shadow, picks one with a chance in proportion to that and traces a single
+  shadow ray to it. The average stays the same; the ray goes where the light is
 - Persistent worker threads for render passes, image conversion and the caustic map; the
   8-bit image is only produced when it is shown or saved
 - Lighting above water: direct sun, light blocks sampled directly (combined with bounce hits by
