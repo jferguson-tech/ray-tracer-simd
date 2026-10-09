@@ -507,6 +507,7 @@ struct Settings {
     int offlineTargetSamples = 1000;  // For offline rendering
     std::string outputDir = "output";
     int threads = 0;                  // 0 = one per hardware thread
+    float adaptiveTolerance = 0.0f;   // --adaptive: stop sampling where the image is this steady (0: off)
     
     int renderPreset = 3;             // the render size as a number, 1 to 6
     float targetFps = 0.0f;           // window: lower the render size while the view moves to hold this (0: off)
@@ -3289,6 +3290,75 @@ class Renderer {
     int sampleCount;
     int currentWidth, currentHeight;
     static constexpr int TILE_SIZE = 8;
+    // Adaptive sampling (--adaptive, for --offline and --bench without the
+    // denoiser). Every second pass is also summed on its own; where the image
+    // from those passes and the image from all of them agree, the image has
+    // settled. This is judged per tile, in the values the picture is stored
+    // in (after tone mapping), and a settled tile is left out of the passes
+    // that follow, once the tiles around it have settled too.
+    //
+    // A pixel's samples in a pass do not depend on which tiles are still
+    // rendered, and the decisions follow from the sums alone, so the image is
+    // the same on any number of threads.
+    static constexpr int ADAPTIVE_FIRST_CHECK = 16;     // passes before the first judgment
+    static constexpr int ADAPTIVE_CHECK_EVERY = 8;      // ... and between judgments
+    bool adaptive = false;
+    std::vector<Vec3> halfAccumulator;      // the even passes only
+    std::vector<int> tilePasses;            // passes a tile has received
+    std::vector<uint8_t> tileSettled, tileActive;
+    int activeTiles = 0;
+    int tilesAcross() const { return (currentWidth + TILE_SIZE - 1) / TILE_SIZE; }
+    int tilesDown() const { return (currentHeight + TILE_SIZE - 1) / TILE_SIZE; }
+
+    static Vec3 displayValue(Vec3 color) {
+        color.x = std::pow(color.x / (1.0f + color.x), 1.0f / 2.2f);
+        color.y = std::pow(color.y / (1.0f + color.y), 1.0f / 2.2f);
+        color.z = std::pow(color.z / (1.0f + color.z), 1.0f / 2.2f);
+        return color;
+    }
+
+    // After a pass: which tiles have settled, and which are still rendered
+    void judgeTiles() {
+        const int tilesX = tilesAcross(), tilesY = tilesDown(), total = tilesX * tilesY;
+        const float tolerance = g_settings.adaptiveTolerance / 255.0f;
+        g_pool.run(std::max(1, std::min(renderThreadCount(), total / 64)), [&](int t) {
+            const int threads = std::max(1, std::min(renderThreadCount(), total / 64));
+            const int begin = int(int64_t(total) * t / threads), end = int(int64_t(total) * (t + 1) / threads);
+            for (int tile = begin; tile < end; tile++) {
+                if (tileSettled[tile]) continue;
+                const int startX = (tile % tilesX) * TILE_SIZE, startY = (tile / tilesX) * TILE_SIZE;
+                const int endX = std::min(startX + TILE_SIZE, currentWidth), endY = std::min(startY + TILE_SIZE, currentHeight);
+                const float all = float(tilePasses[tile] * SAMPLES_PER_PIXEL);
+                const float half = float((tilePasses[tile] / 2) * SAMPLES_PER_PIXEL);
+                float difference = 0.0f;
+                for (int y = startY; y < endY; y++) {
+                    for (int x = startX; x < endX; x++) {
+                        const int idx = y * currentWidth + x;
+                        const Vec3 a = displayValue(accumulator[idx] / all);
+                        const Vec3 b = displayValue(halfAccumulator[idx] / half);
+                        difference += std::abs(a.x - b.x) + std::abs(a.y - b.y) + std::abs(a.z - b.z);
+                    }
+                }
+                difference /= 3.0f * float((endX - startX) * (endY - startY));
+                if (difference < tolerance) tileSettled[tile] = 1;
+            }
+        });
+        // A settled tile goes on while a tile next to it has not settled, so
+        // the amount of noise does not jump along tile edges
+        activeTiles = 0;
+        for (int ty = 0; ty < tilesY; ty++) {
+            for (int tx = 0; tx < tilesX; tx++) {
+                bool active = false;
+                for (int ny = std::max(0, ty - 1); ny <= std::min(tilesY - 1, ty + 1) && !active; ny++) {
+                    for (int nx = std::max(0, tx - 1); nx <= std::min(tilesX - 1, tx + 1) && !active; nx++) {
+                        active = !tileSettled[ny * tilesX + nx];
+                    }
+                }
+                tileActive[ty * tilesX + tx] = active;
+                activeTiles += active ? 1 : 0;
+            }
+        }
+    }
     
     bool getCameraUnderwater(const Camera& camera, const World& world) const {
         int camX = static_cast<int>(std::floor(camera.position.x));
@@ -3366,9 +3436,22 @@ public:
         }
         if (!gather) surfacesValid = false;
 
+        if (sampleCount == 1) {
+            adaptive = g_settings.adaptiveTolerance > 0.0f && !g_settings.denoise;
+            if (adaptive) {
+                const int tiles = tilesAcross() * tilesDown();
+                halfAccumulator.assign(size_t(currentWidth) * currentHeight, Vec3(0, 0, 0));
+                tilePasses.assign(tiles, 0);
+                tileSettled.assign(tiles, 0);
+                tileActive.assign(tiles, 1);
+                activeTiles = tiles;
+            }
+        }
+
         g_pool.run(renderThreadCount(), [&](int) { renderThread(camera, world, cameraUnderwater, gather); });
         if (gather) surfacesValid = true;
         framebufferStale = true;
+        if (adaptive && sampleCount >= ADAPTIVE_FIRST_CHECK && sampleCount % ADAPTIVE_CHECK_EVERY == 0) judgeTiles();
     }
 
     // Convert accumulator to framebuffer: tone mapping and gamma, per pixel.
@@ -3385,7 +3468,9 @@ public:
             int begin = int(int64_t(total) * t / threads);
             int end = int(int64_t(total) * (t + 1) / threads);
             for (int i = begin; i < end; i++) {
-                Vec3 color = filtered ? denoised[i] : accumulator[i] / float(sampleCount * SAMPLES_PER_PIXEL);
+                int passes = sampleCount;
+                if (adaptive) passes = tilePasses[(i / currentWidth / TILE_SIZE) * tilesAcross() + (i % currentWidth) / TILE_SIZE];
+                Vec3 color = filtered ? denoised[i] : accumulator[i] / float(passes * SAMPLES_PER_PIXEL);
 
                 color.x = color.x / (1.0f + color.x);
                 color.y = color.y / (1.0f + color.y);
@@ -3610,6 +3695,12 @@ public:
             int tileIndex = nextTile.fetch_add(1);
             if (tileIndex >= totalTiles) break;
             
+            if (adaptive) {
+                if (!tileActive[tileIndex]) continue;
+                tilePasses[tileIndex] = sampleCount;
+            }
+            const bool evenPass = adaptive && (sampleCount & 1) == 0;
+
             int tileX = tileIndex % tilesX;
             int tileY = tileIndex / tilesX;
             int startX = tileX * TILE_SIZE;
@@ -3646,6 +3737,7 @@ public:
                     }
                     
                     accumulator[idx] = accumulator[idx] + color;
+                    if (evenPass) halfAccumulator[idx] = halfAccumulator[idx] + color;
                 }
             }
         }
@@ -3657,6 +3749,20 @@ public:
         return framebuffer.data();
     }
     int getSampleCount() const { return sampleCount * SAMPLES_PER_PIXEL; }
+    // --adaptive: every tile has settled, so more passes would change nothing
+    bool settled() const { return adaptive && sampleCount > 0 && activeTiles == 0; }
+    // Samples taken, over all pixels (fewer than pixels x samples with --adaptive)
+    double pixelSamples() const {
+        if (!adaptive) return double(currentWidth) * currentHeight * getSampleCount();
+        double sum = 0.0;
+        const int tilesX = tilesAcross();
+        for (size_t tile = 0; tile < tilePasses.size(); tile++) {
+            const int startX = int(tile % tilesX) * TILE_SIZE, startY = int(tile / tilesX) * TILE_SIZE;
+            sum += double(std::min(startX + TILE_SIZE, currentWidth) - startX) *
+                   (std::min(startY + TILE_SIZE, currentHeight) - startY) * tilePasses[tile] * SAMPLES_PER_PIXEL;
+        }
+        return sum;
+    }
     int getWidth() const { return currentWidth; }
     int getHeight() const { return currentHeight; }
     
@@ -4035,11 +4141,11 @@ int runFixedBenchmark(const World& world, int samples) {
         renderer.setFrameSeed(uint64_t(viewIndex++));
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        while (renderer.getSampleCount() < samples) renderer.render(camera, world, false);
+        while (renderer.getSampleCount() < samples && !renderer.settled()) renderer.render(camera, world, false);
         double seconds = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
 
         uint64_t rays = renderer.getRayCount();
-        double pixelSamples = double(g_settings.renderWidth) * g_settings.renderHeight * renderer.getSampleCount();
+        double pixelSamples = renderer.pixelSamples();
         std::string image = g_settings.outputDir + "/bench_" + v.name + ".png";
         renderer.saveFrame(image);
         std::cout << std::left << std::setw(12) << v.name << std::right << std::fixed
@@ -4139,6 +4245,12 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--resolution" && i + 1 < argc) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
+        } else if (arg == "--adaptive") {
+            // An optional number follows: the tolerance
+            g_settings.adaptiveTolerance = 1.0f;
+            if (i + 1 < argc && (std::isdigit(static_cast<unsigned char>(argv[i + 1][0])) || argv[i + 1][0] == '.')) {
+                g_settings.adaptiveTolerance = std::max(0.0f, std::stof(argv[++i]));
+            }
         } else if (arg == "--fps" && i + 1 < argc) {
             g_settings.targetFps = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--caustic-quality" && i + 1 < argc) {
@@ -4156,6 +4268,10 @@ int main(int argc, char* argv[]) {
                          "  --start-frame <n>    with --offline: begin at frame n, to continue a render that was stopped\n"
                          "  --samples <n>        samples per pixel: offline frames (default 1000), --bench (default 32)\n"
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
+                         "  --adaptive [t]       --offline and --bench: stop sampling the parts of the image that have\n"
+                         "                       settled; --samples is then the most a pixel gets. t is how far the\n"
+                         "                       picture may still be from settled, in steps of its 8-bit values\n"
+                         "                       (default 1; smaller is stricter). Not used with --denoise\n"
                          "  --fps <n>            window: while the view moves, lower the render size as far as needed to\n"
                          "                       hold n frames per second; the chosen size returns when it stops\n"
                          "  --threads <n>        render threads (default: all)\n"
@@ -4645,7 +4761,7 @@ int main(int argc, char* argv[]) {
         
         // Save frame for offline rendering
         if (g_settings.mode == Settings::MODE_OFFLINE_RENDER) {
-            if (renderer.getSampleCount() >= g_settings.offlineTargetSamples) {
+            if (renderer.getSampleCount() >= g_settings.offlineTargetSamples || renderer.settled()) {
                 std::stringstream ss;
                 ss << g_settings.outputDir << "/frame_" << std::setfill('0') 
                    << std::setw(5) << offlineFrameCount << ".png";
@@ -4654,7 +4770,13 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 std::cout << "Saved frame " << offlineFrameCount << " (samples: " 
-                         << renderer.getSampleCount() << ")\n";
+                         << renderer.getSampleCount();
+                if (g_settings.adaptiveTolerance > 0.0f && !g_settings.denoise) {
+                    std::cout << " at most, " << std::fixed << std::setprecision(1)
+                              << renderer.pixelSamples() / (double(renderer.getWidth()) * renderer.getHeight())
+                              << " on average";
+                }
+                std::cout << ")\n";
                 offlineFrameCount++;
                 renderer.reset(true);     // the next frame is another view of the same scene
             }
