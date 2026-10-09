@@ -206,9 +206,10 @@ struct CameraKeyframe {
     float time;
     float x, y, z;
     float yaw, pitch;
+    float timeOfDay;        // 0 to 1, or negative: this keyframe does not set it
     
-    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch)
-        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch) {}
+    CameraKeyframe(float t, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f)
+        : time(t), x(x), y(y), z(z), yaw(yaw), pitch(pitch), timeOfDay(timeOfDay) {}
 };
 
 // Demo path recorder/player
@@ -217,9 +218,36 @@ public:
     std::vector<CameraKeyframe> keyframes;
     float totalDuration = 0;
     
-    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch) {
-        keyframes.emplace_back(time, x, y, z, yaw, pitch);
+    void addKeyframe(float time, float x, float y, float z, float yaw, float pitch, float timeOfDay = -1.0f) {
+        keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
         totalDuration = std::max(totalDuration, time);
+    }
+
+    // The time of day at a moment of the path, if any of its keyframes sets
+    // one: it moves evenly from one keyframe that sets it to the next, and
+    // holds the first value before the first of them and the last value after
+    // the last.
+    bool getTimeOfDay(float time, float& timeOfDay) const {
+        if (totalDuration > 0) {            // the path loops, like the camera
+            time = std::fmod(time, totalDuration);
+            if (time < 0) time += totalDuration;
+        }
+        const CameraKeyframe* before = nullptr;
+        const CameraKeyframe* after = nullptr;
+        for (const auto& kf : keyframes) {
+            if (kf.timeOfDay < 0.0f) continue;
+            if (kf.time > time) { after = &kf; break; }
+            before = &kf;
+        }
+        if (!before && !after) return false;
+        if (!before || !after) {
+            timeOfDay = (before ? before : after)->timeOfDay;
+            return true;
+        }
+        float span = after->time - before->time;
+        float t = span > 1e-6f ? (time - before->time) / span : 0.0f;
+        timeOfDay = before->timeOfDay + (after->timeOfDay - before->timeOfDay) * t;
+        return true;
     }
     
     void clear() {
@@ -288,6 +316,7 @@ public:
             json.addNumber("z", kf.z);
             json.addNumber("yaw", kf.yaw);
             json.addNumber("pitch", kf.pitch);
+            if (kf.timeOfDay >= 0.0f) json.addNumber("time_of_day", kf.timeOfDay);
             json.endObject();
         }
         
@@ -349,9 +378,17 @@ public:
                 size_t pitchPos = content.find("\"pitch\":", kfPos);
                 pitch = std::stof(content.substr(pitchPos + 8));
                 
-                keyframes.emplace_back(time, x, y, z, yaw, pitch);
+                // Optional: the time of day from this keyframe on (see getTimeOfDay)
+                float timeOfDay = -1.0f;
+                size_t closePos = content.find("}", kfPos);
+                size_t dayPos = content.find("\"time_of_day\":", kfPos);
+                if (dayPos != std::string::npos && dayPos < closePos) {
+                    timeOfDay = std::max(0.0f, std::min(1.0f, std::stof(content.substr(dayPos + 14))));
+                }
                 
-                kfPos = content.find("}", kfPos);
+                keyframes.emplace_back(time, x, y, z, yaw, pitch, timeOfDay);
+                
+                kfPos = closePos;
             }
         }
         
@@ -471,7 +508,11 @@ struct Settings {
     std::string outputDir = "output";
     int threads = 0;                  // 0 = one per hardware thread
     
+    int renderPreset = 3;             // the render size as a number, 1 to 6
+    float targetFps = 0.0f;           // window: lower the render size while the view moves to hold this (0: off)
+
     void adjustRenderResolution(int preset) {
+        if (preset >= 1 && preset <= 6) renderPreset = preset;
         switch(preset) {
             case 1: renderWidth = 256; renderHeight = 144; break;   // 16:9 (144p)
             case 2: renderWidth = 426; renderHeight = 240; break;   // 16:9 (240p)
@@ -4098,6 +4139,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--resolution" && i + 1 < argc) {
             int preset = std::stoi(argv[++i]);
             g_settings.adjustRenderResolution(preset);
+        } else if (arg == "--fps" && i + 1 < argc) {
+            g_settings.targetFps = std::max(0.0f, std::stof(argv[++i]));
         } else if (arg == "--caustic-quality" && i + 1 < argc) {
             g_settings.causticQuality = std::max(1, std::min(3, std::stoi(argv[++i])));
         } else if (arg == "--play") {
@@ -4113,6 +4156,8 @@ int main(int argc, char* argv[]) {
                          "  --start-frame <n>    with --offline: begin at frame n, to continue a render that was stopped\n"
                          "  --samples <n>        samples per pixel: offline frames (default 1000), --bench (default 32)\n"
                          "  --resolution <1-6>   144p, 240p, 360p (default), 480p, 720p, 1080p\n"
+                         "  --fps <n>            window: while the view moves, lower the render size as far as needed to\n"
+                         "                       hold n frames per second; the chosen size returns when it stops\n"
                          "  --threads <n>        render threads (default: all)\n"
                          "  --seed <n>           world seed (default 42)\n"
                          "  --caustic-quality <1-3>  caustic map detail: 2, 4 or 8 texels per block (default 2; offline uses 3)\n"
@@ -4223,6 +4268,7 @@ int main(int argc, char* argv[]) {
     int frameCount = 0;
     int currentFPS = 0;
     float demoTime = 0;
+    float recordedTimeOfDay = g_settings.timeOfDay;     // as of the last recorded keyframe
     
     // Load demo if in playback/benchmark/offline mode
     if (g_settings.mode == Settings::MODE_PLAYBACK || 
@@ -4254,6 +4300,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\nControls:\n";
     std::cout << "F1: Start/Stop Recording | F2: Play Demo | F3: Benchmark\n";
     std::cout << "F5: Save Demo | F6: Load Demo\n";
+    std::cout << "P: Save the image to output/screenshot_NNNN.png\n";
     std::cout << "Movement: WASD + Space/Shift | Look: Mouse\n";
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
@@ -4271,6 +4318,21 @@ int main(int argc, char* argv[]) {
     int offlineFrameCount = startFrame;
     uint64_t renderedFrames = 0;
     
+    // --fps: the render size the user chose, and how the last frames compared
+    // with the time a frame may take
+    int chosenPreset = g_settings.renderPreset;
+    float workTime = 0.0f;              // the last frame, without the wait for the display
+    int framesOver = 0, framesUnder = 0;
+    float stillTime = 0.0f;
+    auto setRenderPreset = [&](int preset) {
+        g_settings.adjustRenderResolution(preset);
+        renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
+            SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
+        SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+    };
+
     while (running) {
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
@@ -4300,6 +4362,7 @@ int main(int argc, char* argv[]) {
                                 g_settings.mode = Settings::MODE_RECORDING;
                                 demoPath.clear();
                                 startTime = currentTime;
+                                recordedTimeOfDay = g_settings.timeOfDay;
                                 std::cout << "Recording started...\n";
                             }
                             break;
@@ -4331,16 +4394,30 @@ int main(int argc, char* argv[]) {
                         case SDLK_F6:
                             demoPath.loadFromFile(demoFile);
                             break;
+
+                        case SDLK_p: {
+                            // The image as it is shown, under the first number not yet used
+                            std::filesystem::create_directories(g_settings.outputDir);
+                            std::string name;
+                            for (int n = 1; n < 100000; n++) {
+                                std::stringstream ss;
+                                ss << g_settings.outputDir << "/screenshot_" << std::setfill('0') << std::setw(4) << n << ".png";
+                                name = ss.str();
+                                if (!std::filesystem::exists(name)) break;
+                            }
+                            if (renderer.saveFrame(name)) {
+                                std::cout << "Saved " << name << " (samples: " << renderer.getSampleCount() << ")\n";
+                            } else {
+                                std::cerr << "Could not write " << name << "\n";
+                            }
+                            break;
+                        }
                         
                         // Other controls same as original
                         case SDLK_1: case SDLK_2: case SDLK_3:
                         case SDLK_4: case SDLK_5: case SDLK_6:
-                            g_settings.adjustRenderResolution(event.key.keysym.sym - SDLK_0);
-                            renderer.resize(g_settings.renderWidth, g_settings.renderHeight);
-                            if (texture) SDL_DestroyTexture(texture);
-                            texture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_RGB888,
-                                SDL_TEXTUREACCESS_STREAMING, g_settings.renderWidth, g_settings.renderHeight);
-                            SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+                            chosenPreset = event.key.keysym.sym - SDLK_0;
+                            setRenderPreset(chosenPreset);
                             std::cout << "Render: " << g_settings.renderWidth << "x" << g_settings.renderHeight << "\n";
                             needsReset = true;
                             break;
@@ -4457,8 +4534,16 @@ int main(int argc, char* argv[]) {
         if (g_settings.mode == Settings::MODE_RECORDING) {
             float recordInterval = 0.033f; // 30 Hz recording rate
             if (std::chrono::duration<float>(currentTime - lastRecordTime).count() >= recordInterval) {
+                // T or G was pressed since the last keyframe: that one keeps
+                // the time of day from before, this one gets the new one
+                if (recordedTimeOfDay != g_settings.timeOfDay && !demoPath.keyframes.empty() &&
+                    demoPath.keyframes.back().timeOfDay < 0.0f) {
+                    demoPath.keyframes.back().timeOfDay = recordedTimeOfDay;
+                }
                 demoPath.addKeyframe(totalElapsed, camera.position.x, camera.position.y, 
-                                    camera.position.z, camera.yaw, camera.pitch);
+                                    camera.position.z, camera.yaw, camera.pitch,
+                                    recordedTimeOfDay != g_settings.timeOfDay ? g_settings.timeOfDay : -1.0f);
+                recordedTimeOfDay = g_settings.timeOfDay;
                 lastRecordTime = currentTime;
             }
         }
@@ -4481,6 +4566,8 @@ int main(int argc, char* argv[]) {
             float x, y, z, yaw, pitch;
             if (demoPath.getInterpolatedCamera(demoTime, x, y, z, yaw, pitch)) {
                 camera.setFromKeyframe(x, y, z, yaw, pitch);
+                // A path that sets the time of day moves the sun with it
+                demoPath.getTimeOfDay(demoTime, g_settings.timeOfDay);
                 
                 // Only mark camera as moving for non-offline modes
                 if (g_settings.mode != Settings::MODE_OFFLINE_RENDER) {
@@ -4504,6 +4591,36 @@ int main(int argc, char* argv[]) {
             }
         }
         
+        // --fps: while the view moves, lower the render size when frames take
+        // too long and step it back up, as far as the chosen size, when there is
+        // room for the next size (about twice the pixels). A still view goes
+        // back to the chosen size and refines there.
+        if (g_settings.targetFps > 0.0f && !offlineMode && g_settings.mode != Settings::MODE_BENCHMARK) {
+            const float allowed = 1.0f / g_settings.targetFps;
+            int preset = g_settings.renderPreset;
+            if (cameraMoving) {
+                stillTime = 0.0f;
+                framesOver = workTime > allowed * 1.1f ? framesOver + 1 : 0;
+                framesUnder = workTime < allowed * 0.4f ? framesUnder + 1 : 0;
+                if (framesOver >= 2 && preset > 1) {
+                    // Far over: straight to the size whose pixel count should fit
+                    static const float pixels[7] = {0, 256 * 144, 426 * 240, 640 * 360, 854 * 480, 1280 * 720, 1920 * 1080};
+                    const float perPixel = workTime / pixels[preset];
+                    preset--;
+                    while (preset > 1 && perPixel * pixels[preset] > allowed) preset--;
+                }
+                else if (framesUnder >= 12 && preset < chosenPreset) preset++;
+            } else {
+                stillTime += deltaTime;
+                if (stillTime >= 0.3f) preset = chosenPreset;
+            }
+            if (preset != g_settings.renderPreset) {
+                setRenderPreset(preset);
+                framesOver = framesUnder = 0;
+                needsReset = true;
+            }
+        }
+
         if (needsReset) {
             renderer.reset();
         }
@@ -4549,6 +4666,7 @@ int main(int argc, char* argv[]) {
                             g_settings.renderWidth * sizeof(uint32_t));
             SDL_RenderClear(sdlRenderer);
             SDL_RenderCopy(sdlRenderer, texture, nullptr, nullptr);
+            workTime = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - currentTime).count();
             SDL_RenderPresent(sdlRenderer);
         }
         
@@ -4566,6 +4684,9 @@ int main(int argc, char* argv[]) {
             if (!offlineMode) {
                 std::cout << "FPS: " << frameCount << " (Samples: " 
                          << renderer.getSampleCount() << ")";
+                if (g_settings.targetFps > 0.0f) {
+                    std::cout << " [" << g_settings.renderWidth << "x" << g_settings.renderHeight << "]";
+                }
                 
                 switch (g_settings.mode) {
                     case Settings::MODE_RECORDING:
