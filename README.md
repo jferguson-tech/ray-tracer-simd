@@ -79,6 +79,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--start-frame <n>` | With `--offline`: begin at frame `n` instead of 0, to continue a render that was stopped |
 | `--samples <n>` | Samples per pixel: offline frames (default 1000), `--bench` (default 32) |
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
+| `--adaptive [t]` | `--offline` and `--bench`: stop sampling the parts of the image that have settled; `--samples` is then the most a pixel gets. `t` is how far the picture may still be from settled, in steps of its 8-bit values (default 1; smaller is stricter). Not used with `--denoise` (default: off) |
 | `--threads <n>` | Render threads (default: all) |
 | `--seed <n>` | World seed (default 42) |
 | `--time <0-1>` | Time of day (default 0.85; 0.5 is midday) |
