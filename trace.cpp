@@ -4163,6 +4163,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\nControls:\n";
     std::cout << "F1: Start/Stop Recording | F2: Play Demo | F3: Benchmark\n";
     std::cout << "F5: Save Demo | F6: Load Demo\n";
+    std::cout << "P: Save the image to output/screenshot_NNNN.png\n";
     std::cout << "Movement: WASD + Space/Shift | Look: Mouse\n";
     std::cout << "Render Res: 1-6 | Window Size: Q/E\n";
     std::cout << "New World: R/F | Time: T/G | Quit: ESC\n";
@@ -4241,6 +4242,24 @@ int main(int argc, char* argv[]) {
                         case SDLK_F6:
                             demoPath.loadFromFile(demoFile);
                             break;
+
+                        case SDLK_p: {
+                            // The image as it is shown, under the first number not yet used
+                            std::filesystem::create_directories(g_settings.outputDir);
+                            std::string name;
+                            for (int n = 1; n < 100000; n++) {
+                                std::stringstream ss;
+                                ss << g_settings.outputDir << "/screenshot_" << std::setfill('0') << std::setw(4) << n << ".png";
+                                name = ss.str();
+                                if (!std::filesystem::exists(name)) break;
+                            }
+                            if (renderer.saveFrame(name)) {
+                                std::cout << "Saved " << name << " (samples: " << renderer.getSampleCount() << ")\n";
+                            } else {
+                                std::cerr << "Could not write " << name << "\n";
+                            }
+                            break;
+                        }
                         
                         // Other controls same as original
                         case SDLK_1: case SDLK_2: case SDLK_3:
