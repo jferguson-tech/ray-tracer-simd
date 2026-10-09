@@ -79,6 +79,7 @@ g++ -O3 -mavx2 -pthread -std=c++17 trace.cpp -o pathtracer -lSDL2
 | `--start-frame <n>` | With `--offline`: begin at frame `n` instead of 0, to continue a render that was stopped |
 | `--samples <n>` | Samples per pixel: offline frames (default 1000), `--bench` (default 32) |
 | `--resolution <1-6>` | 144p, 240p, 360p (default), 480p, 720p, 1080p |
+| `--fps <n>` | Window: while the view moves, lower the render size as far as needed to hold `n` frames per second; the chosen size returns when the view stops (default: off) |
 | `--threads <n>` | Render threads (default: all) |
 | `--seed <n>` | World seed (default 42) |
 | `--time <0-1>` | Time of day (default 0.85; 0.5 is midday) |
